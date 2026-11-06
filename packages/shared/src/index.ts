@@ -10,3 +10,4 @@ export * from "./schemas/booking.ts";
 export * from "./schemas/order.ts";
 export * from "./schemas/availability.ts";
 export * from "./config-pack.ts";
+export * from "./context.ts";

@@ -12,7 +12,7 @@ Rules for every agent
 ## Stage 0 (done, coordinator)
 Root workspace, contracts (`docs/ARCHITECTURE.md`), brand (`docs/BRAND.md`), shared enums, dependency install.
 
-## Stage 1: foundations (4 agents in parallel)
+## Stage 1: foundations (DONE, merged, pushed: 242 db + 203 other tests)
 | Agent | Owns | Delivers |
 | --- | --- | --- |
 | db | `packages/db`, `infra/` | Full schema as SQL migrations (platform + tenant tables), RLS policies, roles, booking exclusion constraint, idempotency table, audit log, outbox, seed with two fake tenants, migrate/seed scripts, docker-compose (Postgres 54329, Redis, MinIO), tests for RLS isolation + double booking + hold expiry |
@@ -20,8 +20,14 @@ Root workspace, contracts (`docs/ARCHITECTURE.md`), brand (`docs/BRAND.md`), sha
 | brand-ui | `packages/ui`, `apps/web` (shell only) | `theme.css` from QenBel tokens, self-hosted Hanken Grotesk, Logo, base components, web shell (Vite + React + PWA manifest, router, layout, pack-driven nav placeholder, sign-in placeholder), no third-party assets, brand/a11y checks |
 | contracts | `docs/` (new files only), `packages/tool-registry` | `docs/MVP-REQUIREMENTS.md`, tool registry with all 13 tools (zod in/out, permission level, idempotency flag, descriptions), JSON Schema + OpenAPI 3.1 generation, tests |
 
-## Stage 2: engines (after Stage 1 merges)
-api-core (NestJS app, tenancy interceptor, auth provider interface, permissions, audit, idempotency), crm-catalogue-resources, booking-engine, order-engine. Parallel by module.
+## Stage 2: engines (4 agents in parallel)
+Domain logic lives in plain TS packages (no Nest decorators) so it is testable with `node --test` against the Docker Postgres. Engines take `(sql: SqlClient, ctx: EngineContext, input)` (see `packages/shared/src/context.ts`), run inside `withTenant` supplied by the caller, write domain events to `outbox_events` in the same transaction, and throw `AppError`. The API is a thin HTTP layer over them (Stage 3 wires controllers).
+| Agent | Owns | Delivers |
+| --- | --- | --- |
+| api-core | `apps/api` | NestJS bootstrap, config, AuthProvider (dev + clerk verification), principals, tenancy via withTenant, permission guard + route-permission test, API-credential hashing/lookup, idempotency, error filter (SQLSTATE mapping), audit, health, platform-admin tenant creation + onboarding endpoint |
+| engine-catalog | `packages/engine-catalog` | customers/CRM (search, notes, tags, follow-ups, comms), catalogue, resources, schedules, business hours, holidays, locations; availability inputs loaders |
+| engine-bookings | `packages/engine-bookings` | availability, hold/confirm/reschedule/cancel/check-in/complete/no-show, policies, deposits, hold-expiry job fn, events |
+| engine-orders | `packages/engine-orders` | drafts, items, tax/discount, state machine, fulfilment, payments ledger, refunds, events |
 
 ## Stage 3: surfaces
 Tool gateway + signed webhooks + notifications; web screens (dashboard, calendar, orders board, customers, catalogue, settings, onboarding with pack choice); public API client generation.
