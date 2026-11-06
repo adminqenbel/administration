@@ -124,3 +124,159 @@ export const PaymentStatus = {
   REFUNDED: "refunded",
 } as const;
 export type PaymentStatus = (typeof PaymentStatus)[keyof typeof PaymentStatus];
+
+// ---- Operational enums (match the database CHECK constraints in packages/db/migrations) ----
+
+export const DeploymentMode = {
+  CENTRAL: "central",
+  ISOLATED: "isolated",
+} as const;
+export type DeploymentMode = (typeof DeploymentMode)[keyof typeof DeploymentMode];
+
+export const TenantStatus = {
+  ACTIVE: "active",
+  SUSPENDED: "suspended",
+  ARCHIVED: "archived",
+} as const;
+export type TenantStatus = (typeof TenantStatus)[keyof typeof TenantStatus];
+
+export const AuthProviderKind = {
+  DEV: "dev",
+  CLERK: "clerk",
+} as const;
+export type AuthProviderKind = (typeof AuthProviderKind)[keyof typeof AuthProviderKind];
+
+export const ConversationStatus = {
+  OPEN: "open",
+  ESCALATED: "escalated",
+  CLOSED: "closed",
+} as const;
+export type ConversationStatus = (typeof ConversationStatus)[keyof typeof ConversationStatus];
+
+export const MessageRole = {
+  USER: "user",
+  ASSISTANT: "assistant",
+  TOOL: "tool",
+  SYSTEM: "system",
+} as const;
+export type MessageRole = (typeof MessageRole)[keyof typeof MessageRole];
+
+export const FollowUpStatus = {
+  OPEN: "open",
+  DONE: "done",
+  CANCELLED: "cancelled",
+} as const;
+export type FollowUpStatus = (typeof FollowUpStatus)[keyof typeof FollowUpStatus];
+
+export const FollowUpOrigin = {
+  STAFF: "staff",
+  AI_ESCALATION: "ai_escalation",
+  SYSTEM: "system",
+} as const;
+export type FollowUpOrigin = (typeof FollowUpOrigin)[keyof typeof FollowUpOrigin];
+
+export const OutboxStatus = {
+  PENDING: "pending",
+  PROCESSING: "processing",
+  DELIVERED: "delivered",
+  FAILED: "failed",
+  DEAD: "dead",
+} as const;
+export type OutboxStatus = (typeof OutboxStatus)[keyof typeof OutboxStatus];
+
+export const WebhookDeliveryStatus = {
+  PENDING: "pending",
+  SUCCEEDED: "succeeded",
+  FAILED: "failed",
+} as const;
+export type WebhookDeliveryStatus = (typeof WebhookDeliveryStatus)[keyof typeof WebhookDeliveryStatus];
+
+export const NotificationChannel = {
+  EMAIL: "email",
+  WHATSAPP: "whatsapp",
+  SMS: "sms",
+  IN_APP: "in_app",
+} as const;
+export type NotificationChannel = (typeof NotificationChannel)[keyof typeof NotificationChannel];
+
+export const NotificationStatus = {
+  QUEUED: "queued",
+  SENDING: "sending",
+  SENT: "sent",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+} as const;
+export type NotificationStatus = (typeof NotificationStatus)[keyof typeof NotificationStatus];
+
+export const PaymentKind = {
+  PAYMENT: "payment",
+  REFUND: "refund",
+} as const;
+export type PaymentKind = (typeof PaymentKind)[keyof typeof PaymentKind];
+
+export const PaymentMethod = {
+  CASH: "cash",
+  CARD: "card",
+  UPI: "upi",
+  BANK_TRANSFER: "bank_transfer",
+  ONLINE: "online",
+  OTHER: "other",
+} as const;
+export type PaymentMethod = (typeof PaymentMethod)[keyof typeof PaymentMethod];
+
+export const PaymentEntryStatus = {
+  PENDING: "pending",
+  COMPLETED: "completed",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+} as const;
+export type PaymentEntryStatus = (typeof PaymentEntryStatus)[keyof typeof PaymentEntryStatus];
+
+export const FulfilmentType = {
+  PICKUP: "pickup",
+  DELIVERY: "delivery",
+  DINE_IN: "dine_in",
+  ON_SITE: "on_site",
+} as const;
+export type FulfilmentType = (typeof FulfilmentType)[keyof typeof FulfilmentType];
+
+export const FulfilmentStatus = {
+  PENDING: "pending",
+  SCHEDULED: "scheduled",
+  IN_PROGRESS: "in_progress",
+  COMPLETED: "completed",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+} as const;
+export type FulfilmentStatus = (typeof FulfilmentStatus)[keyof typeof FulfilmentStatus];
+
+export const CatalogueItemKind = {
+  SERVICE: "service",
+  PRODUCT: "product",
+} as const;
+export type CatalogueItemKind = (typeof CatalogueItemKind)[keyof typeof CatalogueItemKind];
+
+export const AllocationMode = {
+  EXCLUSIVE: "exclusive",
+  SHARED: "shared",
+} as const;
+export type AllocationMode = (typeof AllocationMode)[keyof typeof AllocationMode];
+
+export const AuditOutcome = {
+  SUCCESS: "success",
+  DENIED: "denied",
+  ERROR: "error",
+} as const;
+export type AuditOutcome = (typeof AuditOutcome)[keyof typeof AuditOutcome];
+
+export const CredentialType = {
+  API_KEY: "api_key",
+  WIDGET_KEY: "widget_key",
+} as const;
+export type CredentialType = (typeof CredentialType)[keyof typeof CredentialType];
+
+export const IdempotencyStatus = {
+  IN_PROGRESS: "in_progress",
+  COMPLETED: "completed",
+} as const;
+export type IdempotencyStatus = (typeof IdempotencyStatus)[keyof typeof IdempotencyStatus];

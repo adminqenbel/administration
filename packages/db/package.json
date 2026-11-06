@@ -7,7 +7,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.ts\"",
+    "migrate": "node scripts/db.ts migrate",
+    "migrate:test": "node scripts/db.ts migrate --test",
+    "seed": "node scripts/db.ts seed",
+    "seed:reset": "node scripts/db.ts seed --reset",
+    "db:check": "node scripts/db.ts check",
+    "infra:up": "docker compose -f ../../infra/docker-compose.yml up -d",
+    "infra:down": "docker compose -f ../../infra/docker-compose.yml down",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "check": "tsc -p tsconfig.json"
   },
   "dependencies": {

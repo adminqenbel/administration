@@ -1,0 +1,64 @@
+# QenBel Administration: local development services.
+# Start:  docker compose -f infra/docker-compose.yml up -d   (from the repo root)
+# Secrets come from the environment or from infra/.env (git-ignored). Nothing real is stored here.
+name: qenbel-admin
+
+services:
+  db:
+    image: postgres:17
+    container_name: qenbel-admin-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or infra/.env}
+      POSTGRES_DB: postgres
+      # Optional separate passwords for the runtime roles. Default to POSTGRES_PASSWORD (dev only).
+      QENBEL_APP_PASSWORD: ${QENBEL_APP_PASSWORD:-}
+      QENBEL_MIGRATE_PASSWORD: ${QENBEL_MIGRATE_PASSWORD:-}
+      QENBEL_PLATFORM_PASSWORD: ${QENBEL_PLATFORM_PASSWORD:-}
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - qenbel_admin_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d qenbel_admin"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: qenbel-admin-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in the environment or infra/.env}"]
+    ports:
+      - "127.0.0.1:63799:6379"
+    volumes:
+      - qenbel_admin_redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest  # official minio/minio images are not pullable from Docker Hub/quay (see README)
+    container_name: qenbel-admin-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in the environment or infra/.env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in the environment or infra/.env}
+    ports:
+      - "127.0.0.1:9100:9000"
+      - "127.0.0.1:9101:9001"
+    volumes:
+      - qenbel_admin_miniodata:/data
+
+volumes:
+  qenbel_admin_pgdata:
+  qenbel_admin_redisdata:
+  qenbel_admin_miniodata:
