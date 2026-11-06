@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "preview": "vite preview",
+    "icons": "node scripts/make-icons.mjs",
+    "headers": "node scripts/make-headers.mjs",
     "test": "node --test \"test/**/*.test.ts\"",
     "check": "tsc -p tsconfig.json"
   },

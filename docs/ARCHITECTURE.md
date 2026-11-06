@@ -52,7 +52,7 @@ Auth is behind an `AuthProvider` interface. Implementations: `dev` (fake identit
 ## 5. State machines (data, defined in packs, validated by `@qenbel/shared`)
 
 Booking: `HOLD -> CONFIRMED -> CHECKED_IN -> COMPLETED`; also `HOLD -> EXPIRED`, `HOLD|CONFIRMED -> CANCELLED`, `CONFIRMED -> NO_SHOW`, `CONFIRMED -> CONFIRMED` (reschedule, version bump).
-Order: `DRAFT -> PLACED -> ACCEPTED -> PROCESSING -> READY -> FULFILLED`; also `DRAFT|PLACED|ACCEPTED -> CANCELLED`, `PLACED -> REJECTED`, `FULFILLED|(paid) -> REFUNDED`.
+Order: `DRAFT -> PLACED -> ACCEPTED -> PROCESSING -> READY -> FULFILLED`; also `DRAFT|PLACED|ACCEPTED -> CANCELLED`, `PLACED -> REJECTED`, `FULFILLED -> REFUNDED` (a paid order cancelled before fulfilment becomes `CANCELLED` plus a refund entry in the payments ledger).
 A pack may narrow or relabel transitions (e.g. restaurant `PROCESSING` shown as "Preparing"); it may not add statuses outside these sets.
 
 Double booking is prevented in the database: table `booking_allocations (tenant_id, booking_id, resource_id, period tstzrange, active bool)` with `EXCLUDE USING gist (tenant_id WITH =, resource_id WITH =, period WITH &&) WHERE (active)`. Holds are allocations with `expires_at`; a job sets expired holds `EXPIRED` and `active=false`. Capacity-based resources (tables, group seats) use a `capacity_units` allocation model defined by the db agent and documented in `packages/db/README.md`.

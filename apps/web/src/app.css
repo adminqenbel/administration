@@ -1,0 +1,19 @@
+/* App-level layout. Brand tokens and components come from @qenbel/ui. Flat, no shadows. */
+
+.auth-page { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; background: var(--pale); }
+.auth-page__top { padding: var(--space-4) var(--space-5); background: #fff; border-bottom: 1px solid var(--hair); }
+.auth-page__body { display: grid; align-content: start; justify-items: center; padding: clamp(1.5rem, 6vw, 4rem) var(--space-4); }
+.auth-card { width: min(100%, 32rem); padding: clamp(1.25rem, 4vw, 2rem); background: #fff; border: 1px solid var(--hair); border-radius: var(--radius); display: grid; gap: var(--space-4); }
+.auth-card .qb-form { max-width: none; }
+.auth-card__title { font-weight: 300; font-size: clamp(1.7rem, 1.4rem + 1vw, 2.2rem); line-height: 1.1; letter-spacing: -0.03em; }
+.auth-card__lead { color: var(--ink-2); }
+.notice { padding: 0.7rem 1rem; color: var(--ink-2); background: var(--pale); border-left: 3px solid var(--blue); font-size: var(--text-sm); }
+.toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+.toolbar .qb-field { width: min(100%, 22rem); }
+.split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-5); }
+.stack { display: grid; gap: var(--space-4); }
+.status-key { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.loading-page { min-height: 100vh; display: grid; place-items: center; padding: var(--space-5); }
+.loading-page > div { width: min(100%, 20rem); }
+@media (max-width: 47.99rem) { .split { grid-template-columns: minmax(0, 1fr); } }
+.stack { margin-top: var(--space-5); }
