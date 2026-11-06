@@ -1,0 +1,16 @@
+{
+  "name": "@qenbel/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "check": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}

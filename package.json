@@ -1,0 +1,26 @@
+{
+  "name": "qenbel-administration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "QenBel Administration: multi-tenant booking, order and AI-agent operations platform",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "check": "npm run check --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "db:up": "docker compose -f infra/docker-compose.yml --env-file .env up -d --wait",
+    "db:down": "docker compose -f infra/docker-compose.yml --env-file .env down"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2"
+  }
+}
