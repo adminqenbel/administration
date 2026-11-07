@@ -9,6 +9,7 @@ import {
 import type { ResourceCandidate } from "./availability-source.ts";
 import { loadConfig, type BookingConfig, type EngineOptions } from "./config.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
+import { expireDueHolds } from "./expiry.ts";
 import { withIdempotency } from "./idempotency.ts";
 import { insertAllocations, loadBooking, lockResources, toView } from "./repo.ts";
 import { createHoldInputSchema, parseOrThrow, type CreateHoldInput } from "./schemas.ts";
@@ -39,8 +40,10 @@ function assertPartyFits(set: readonly ResourceCandidate[], partySize: number | 
  * Hold a slot. Resource choice: `resourceId`, several `resourceIds` (all needed at once), or none (the first
  * free eligible resource in name order). The hold expires `holdMinutes` after ctx.now().
  *
- * Concurrency: resource rows are locked in id order, then allocations are inserted in id order; the exclusion
- * constraint decides who wins and the loser gets BOOKING_SLOT_TAKEN. Idempotent per ctx.idempotencyKey.
+ * Concurrency: resource rows are locked in id order, expired holds on them are expired (bookings in id order), then the
+ * booking and its allocations are inserted in id order; the exclusion constraint decides who wins and the loser gets
+ * BOOKING_SLOT_TAKEN. Lock order: resources -> bookings -> allocations, as in the database sweeps (migration 016).
+ * Idempotent per ctx.idempotencyKey. `booking.created` is emitted here, at hold creation (not at confirm).
  */
 export async function createHold(
   sql: SqlClient,
@@ -143,7 +146,11 @@ async function holdOnce(
   plan: HoldPlan,
 ): Promise<string> {
   // Lock first (id order), then check, then write: one consistent lock order for every caller.
-  await lockResources(sql, ctx, set.map((r) => r.id));
+  const resourceIds = set.map((r) => r.id);
+  await lockResources(sql, ctx, resourceIds);
+  // Expired holds on these resources are expired here (bookings locked in id order, with audit + booking.expired), rather
+  // than silently by the allocation trigger. Same lock order as the trigger and the sweeps: resources -> bookings -> allocations.
+  await expireDueHolds(sql, ctx, { cutoff: null, resourceIds, reason: "slot_requested" });
   await assertWindowOpen(sql, ctx, cfg, source, set, plan.startMs, plan.endMs);
 
   const bookingId = ctx.newId();

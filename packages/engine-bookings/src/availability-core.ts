@@ -26,7 +26,7 @@ export interface SlotParams {
   lastDate?: string | null;
   /** Pack hours, used when the location has no hours configured. */
   defaultHours: WeeklyHours;
-  /** Breaks used when the resource has none of its own. */
+  /** Daily breaks used when the resource has no resource_breaks rows. */
   defaultBreaks: readonly TimeInterval[];
   /** Skip the allocation check (used to test "is this window open at all"). */
   ignoreAllocations?: boolean;
@@ -124,7 +124,6 @@ export function slotsForResource(
   const buffer = exclusive ? params.bufferMinutes : 0;
   const bufferMs = buffer * 60_000;
   const units = params.units ?? 1;
-  const breaks = inputs.breaks ?? params.defaultBreaks;
 
   // Exclusive: the stored allocation already ends after its own buffer. Pull each start back by this booking's buffer
   // so a slot cannot end inside the cleanup window that must precede the next booking.
@@ -141,6 +140,11 @@ export function slotsForResource(
     if (intervals.length === 0) continue;
     const hours = emptyWeek();
     hours[weekdayOf(date)] = intervals;
+    const wd = weekdayIndex(date);
+    const breaks: readonly TimeInterval[] =
+      inputs.breaks === null
+        ? params.defaultBreaks
+        : inputs.breaks.filter((b) => b.weekday === wd).map((b) => ({ start: b.start, end: b.end }));
     const slots = generateSlots({
       timezone: resource.timezone,
       date,

@@ -3,6 +3,7 @@
 import { toPaise } from "@qenbel/db";
 import {
   FulfilmentType,
+  type DiscountType,
   type Channel,
   type EngineContext,
   type FulfilmentStatus,
@@ -31,6 +32,11 @@ export interface OrderRow {
   total_paise: string;
   currency: string;
   notes: string | null;
+  discount_type: DiscountType | null;
+  discount_value: string | null;
+  discount_reason: string | null;
+  discount_cap_override: boolean;
+  resource_id: string | null;
   placed_at: Date | null;
   fulfilled_at: Date | null;
   cancelled_at: Date | null;
@@ -47,6 +53,7 @@ export interface ItemRow {
   name: string;
   quantity: number;
   unit_price_paise: string;
+  tax_rate_bps: number;
   tax_paise: string;
   line_total_paise: string;
   notes: string | null;
@@ -70,6 +77,8 @@ export interface OrderItemView {
   name: string;
   quantity: number;
   unitPricePaise: Paise;
+  /** Tax rate frozen on the line when it was added (basis points). */
+  taxRateBps: number;
   taxPaise: Paise;
   linePaise: Paise;
   note: string | null;
@@ -86,6 +95,15 @@ export interface FulfilmentView {
   scheduledFor: string | null;
   completedAt: string | null;
   notes: string | null;
+}
+
+export interface DiscountView {
+  type: DiscountType;
+  /** Paise for `fixed`, basis points for `percent_bps`. */
+  value: number;
+  reason: string | null;
+  /** True when a principal with the override permission approved a discount above the cap. */
+  capOverride: boolean;
 }
 
 export interface PaymentSummary {
@@ -106,11 +124,14 @@ export interface OrderView {
   allowedNext: OrderStatus[];
   customerId: string | null;
   bookingId: string | null;
-  /** The table resource of a dine-in fulfilment, if any. */
+  /** The table resource of a dine-in order (`orders.resource_id`), if any. */
   resourceId: string | null;
   items: OrderItemView[];
   subtotalPaise: Paise;
+  /** The amount taken off. Recomputed from `discount` when draft lines change. */
   discountPaise: Paise;
+  /** How the discount was made (null when none). */
+  discount: DiscountView | null;
   taxPaise: Paise;
   totalPaise: Paise;
   currency: string;
@@ -126,7 +147,7 @@ export interface OrderView {
   cancellationReason: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Things the caller should know, for example "DISCOUNT_CLEARED" after an item change. */
+  /** Things the caller should know, for example "DISCOUNT_CLEARED" when an edit made the discount invalid. */
   notices: string[];
 }
 
@@ -140,13 +161,24 @@ export function itemView(row: ItemRow): OrderItemView {
     name: row.name,
     quantity: row.quantity,
     unitPricePaise: toPaise(row.unit_price_paise),
+    taxRateBps: row.tax_rate_bps,
     taxPaise: toPaise(row.tax_paise),
     linePaise: toPaise(row.line_total_paise),
     note: row.notes,
   };
 }
 
-export function fulfilmentView(row: FulfilmentRow): FulfilmentView {
+export function discountView(row: OrderRow): DiscountView | null {
+  if (row.discount_type === null || row.discount_value === null) return null;
+  return {
+    type: row.discount_type,
+    value: toPaise(row.discount_value),
+    reason: row.discount_reason,
+    capOverride: row.discount_cap_override,
+  };
+}
+
+export function fulfilmentView(row: FulfilmentRow, resourceId: string | null): FulfilmentView {
   const addr = row.address;
   const dineIn = row.type === FulfilmentType.DINE_IN;
   return {
@@ -155,7 +187,7 @@ export function fulfilmentView(row: FulfilmentRow): FulfilmentView {
     status: row.status,
     address: dineIn ? null : addr,
     tableLabel: dineIn && typeof addr?.tableLabel === "string" ? addr.tableLabel : null,
-    resourceId: dineIn && typeof addr?.resourceId === "string" ? addr.resourceId : null,
+    resourceId: dineIn ? resourceId : null,
     scheduledFor: iso(row.scheduled_for),
     completedAt: iso(row.completed_at),
     notes: row.notes,
@@ -225,7 +257,7 @@ export async function buildOrderView(
   const fulfilment = await loadFulfilmentRow(sql, ctx, row.id);
   const sums = await loadLedgerSums(sql, ctx, row.id);
   const totalPaise = toPaise(row.total_paise);
-  const f = fulfilment ? fulfilmentView(fulfilment) : null;
+  const f = fulfilment ? fulfilmentView(fulfilment, row.resource_id) : null;
   return {
     id: row.id,
     reference: row.reference,
@@ -234,10 +266,11 @@ export async function buildOrderView(
     allowedNext: packCtx.nextStatuses(row.status),
     customerId: row.customer_id,
     bookingId: row.booking_id,
-    resourceId: f?.resourceId ?? null,
+    resourceId: row.resource_id,
     items: items.map(itemView),
     subtotalPaise: toPaise(row.subtotal_paise),
     discountPaise: toPaise(row.discount_paise),
+    discount: discountView(row),
     taxPaise: toPaise(row.tax_paise),
     totalPaise,
     currency: row.currency,

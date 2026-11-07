@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, it } from "node:test";
+import { DiscountType } from "@qenbel/shared";
 import {
   DISCOUNT_APPROVAL_CAP_BPS,
   addItem,
@@ -297,6 +298,49 @@ describe("line edits (draft only)", () => {
   });
 });
 
+describe("per-line tax rate is frozen when the line is added", () => {
+  const rates = (orderId: string) =>
+    call((sql) => sql.query<{ name: string; tax_rate_bps: number; tax_paise: number }>("select name, tax_rate_bps, tax_paise::int from order_items where tenant_id = $1 and order_id = $2 order by created_at, id", [fx.tenantId, orderId])).then((r) => r.rows);
+
+  it("order_items.tax_rate_bps is the catalogue rate at insert; later catalogue rate changes do not touch existing lines", async () => {
+    // an item of its own so the shared menu keeps its rates for the other tests
+    const itemId = await call((sql) => insert(sql, "catalogue_items", { tenant_id: fx.tenantId, kind: "product", name: "Rate test cake", base_price_paise: 10000, tax_rate_bps: 1800 }));
+    let o = await draft([{ catalogueItemId: itemId, quantity: 2 }, { catalogueItemId: fx.tikka, quantity: 1 }]);
+    assert.deepEqual((await rates(o.id)).map((r) => [r.tax_rate_bps, r.tax_paise]), [[1800, 3600], [500, 500]]);
+    assert.deepEqual(o.items.map((i) => i.taxRateBps), [1800, 500]);
+
+    await call((sql) => sql.query("update catalogue_items set tax_rate_bps = 500 where tenant_id = $1 and id = $2", [fx.tenantId, itemId]));
+    // unrelated edits, a quantity change and a discount all keep the frozen 18%
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 1, item: { catalogueItemId: fx.papad, quantity: 1 } }));
+    o = await call((s) => updateItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id, quantity: 3 }));
+    assert.equal(o.items[0]?.taxPaise, 5400);
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 3, kind: "percent", bps: 1000 }));
+    assert.equal(o.items[0]?.taxPaise, 4860, "18% of 30000 less its 10% share");
+    assert.deepEqual((await rates(o.id)).map((r) => r.tax_rate_bps), [1800, 500, 0]);
+    assert.equal(o.totalPaise, o.subtotalPaise - o.discountPaise + o.taxPaise);
+
+    // adding the same item again takes the CURRENT rate on a separate line (a different frozen rate never merges)
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 4, item: { catalogueItemId: itemId, quantity: 1 } }));
+    assert.equal(o.items.length, 4);
+    assert.deepEqual((await rates(o.id)).map((r) => r.tax_rate_bps), [1800, 500, 0, 500]);
+    // while an item whose rate has not moved still merges
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 5, item: { catalogueItemId: fx.tikka, quantity: 1 } }));
+    assert.equal(o.items.length, 4);
+    assert.equal(o.items[1]?.quantity, 2);
+  });
+
+  it("the frozen rate survives placement and the catalogue item being archived", async () => {
+    const itemId = await call((sql) => insert(sql, "catalogue_items", { tenant_id: fx.tenantId, kind: "product", name: "Rate test juice", base_price_paise: 5000, tax_rate_bps: 1200 }));
+    const o = await draft([{ catalogueItemId: itemId, quantity: 1 }]);
+    await call((sql) => sql.query("update catalogue_items set tax_rate_bps = 0 where tenant_id = $1 and id = $2", [fx.tenantId, itemId]));
+    const again = await call((s) => updateOrderNotes(s, ctx(), { orderId: o.id, expectedVersion: 1, notes: "x" }));
+    assert.equal(again.taxPaise, 600);
+    const edited = await call((s) => updateItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id, quantity: 2 }));
+    assert.equal(edited.taxPaise, 1200, "still 12%, not the catalogue's new 0%");
+    assert.equal(edited.totalPaise, 10000 + 1200);
+  });
+});
+
 describe("discounts", () => {
   const audits = (orderId: string) =>
     call((sql) => sql.query<{ details: Record<string, unknown> }>("select details from audit_log where tenant_id = $1 and entity_id = $2 and action = 'order.discount_applied' order by seq", [fx.tenantId, orderId]));
@@ -348,17 +392,106 @@ describe("discounts", () => {
     assert.equal(rows[1]?.rounding, "HALF_UP");
   });
 
-  it("an empty draft cannot be discounted; a line change clears the discount and says so", async () => {
+  const discountRow = (orderId: string) =>
+    call((sql) =>
+      sql
+        .query<{ discount_paise: number; discount_type: string | null; discount_value: number | null; discount_reason: string | null; discount_cap_override: boolean }>(
+          "select discount_paise::int, discount_type, discount_value::int, discount_reason, discount_cap_override from orders where tenant_id = $1 and id = $2",
+          [fx.tenantId, orderId],
+        )
+        .then((r) => r.rows[0]!),
+    );
+
+  it("the spec is persisted: type, value, reason and cap flag, using the shared DiscountType values", async () => {
     let o = await draft([{ catalogueItemId: fx.tikka, quantity: 1 }]);
-    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "fixed", amountPaise: 1000 }));
-    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 2, item: { catalogueItemId: fx.soda, quantity: 1 } }));
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "fixed", amountPaise: 700, reason: "regular" }));
+    assert.deepEqual(await discountRow(o.id), { discount_paise: 700, discount_type: DiscountType.FIXED, discount_value: 700, discount_reason: "regular", discount_cap_override: false });
+    assert.deepEqual(o.discount, { type: "fixed", value: 700, reason: "regular", capOverride: false });
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 2, kind: "percent", bps: 5000, capOverride: true, reason: "owner approved" }));
+    assert.deepEqual(await discountRow(o.id), { discount_paise: 5000, discount_type: DiscountType.PERCENT_BPS, discount_value: 5000, discount_reason: "owner approved", discount_cap_override: true });
+    assert.deepEqual(o.discount, { type: "percent_bps", value: 5000, reason: "owner approved", capOverride: true });
+    // the flag is stored only when it was needed
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 3, kind: "percent", bps: 1000, capOverride: true }));
+    assert.equal((await discountRow(o.id)).discount_cap_override, false);
+    assert.equal((await discountRow(o.id)).discount_reason, null);
+  });
+
+  it("a percent discount is RECOMPUTED when lines are added, changed or removed (never cleared)", async () => {
+    let o = await draft([{ catalogueItemId: fx.tikka, quantity: 1 }]); // 10000
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "percent", bps: 1000, reason: "regular" }));
+    assert.equal(o.discountPaise, 1000);
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 2, item: { catalogueItemId: fx.soda, quantity: 1 } })); // 14950
+    assert.equal(o.subtotalPaise, 14950);
+    assert.equal(o.discountPaise, 1495);
+    assert.deepEqual(o.notices, []);
+    assert.equal(o.totalPaise, o.subtotalPaise - o.discountPaise + o.taxPaise);
+    o = await call((s) => updateItem(s, ctx(), { orderId: o.id, expectedVersion: 3, itemId: o.items[0]!.id, quantity: 3 })); // 34950
+    assert.equal(o.discountPaise, 3495);
+    o = await call((s) => removeItem(s, ctx(), { orderId: o.id, expectedVersion: 4, itemId: o.items[1]!.id })); // 30000
+    assert.equal(o.discountPaise, 3000);
+    assert.deepEqual(o.notices, []);
+    assert.deepEqual(await discountRow(o.id), { discount_paise: 3000, discount_type: "percent_bps", discount_value: 1000, discount_reason: "regular", discount_cap_override: false });
+    assert.equal(o.taxPaise, 1350, "5% of 27000");
+  });
+
+  it("a fixed discount keeps its amount while it still fits", async () => {
+    let o = await draft([{ catalogueItemId: fx.tikka, quantity: 2 }]); // 20000
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "fixed", amountPaise: 1500 }));
+    o = await call((s) => updateItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id, quantity: 1 })); // 10000
+    assert.equal(o.discountPaise, 1500);
+    assert.equal(o.totalPaise, 10000 - 1500 + 425);
+    assert.deepEqual(o.notices, []);
+  });
+
+  it("DISCOUNT_CLEARED only when the spec became invalid: above the cap unapproved, or above the subtotal", async () => {
+    let o = await draft([{ catalogueItemId: fx.tikka, quantity: 1 }, { catalogueItemId: fx.soda, quantity: 1 }]); // 14950
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "fixed", amountPaise: 2000, reason: "sorry" }));
+    assert.equal(o.discountPaise, 2000);
+    o = await call((s) => removeItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id })); // tikka gone: 4950, 2000 is 40%
+    assert.equal(o.discountPaise, 0, "40% of the new subtotal and never approved: cleared");
+    assert.deepEqual(o.notices, ["DISCOUNT_CLEARED"]);
+    assert.deepEqual(await discountRow(o.id), { discount_paise: 0, discount_type: null, discount_value: null, discount_reason: null, discount_cap_override: false });
+    assert.equal(o.discount, null);
+    // a later edit does not repeat the notice
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 3, item: { catalogueItemId: fx.papad, quantity: 1 } }));
+    assert.deepEqual(o.notices, []);
+    // an amount larger than the whole new subtotal, even with an override on record
+    let p = await draft([{ catalogueItemId: fx.tikka, quantity: 2 }, { catalogueItemId: fx.papad, quantity: 1 }]); // 20100
+    p = await call((s) => applyDiscount(s, ctx(), { orderId: p.id, expectedVersion: 1, kind: "fixed", amountPaise: 4100, capOverride: true }));
+    assert.equal(p.discountPaise, 4100);
+    assert.equal(p.discount?.capOverride, true);
+    p = await call((s) => removeItem(s, ctx(), { orderId: p.id, expectedVersion: 2, itemId: p.items[0]!.id })); // 100 left
+    assert.equal(p.discountPaise, 0);
+    assert.deepEqual(p.notices, ["DISCOUNT_CLEARED"]);
+  });
+
+  it("a cap override approved earlier keeps covering the spec; without it a fixed discount pushed over the cap is cleared", async () => {
+    let o = await draft([{ catalogueItemId: fx.tikka, quantity: 3 }]); // 30000
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "fixed", amountPaise: 5000, capOverride: true })); // 16.7%: under the cap, flag not needed
+    assert.equal(o.discount?.capOverride, false);
+    o = await call((s) => updateItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id, quantity: 2 })); // 20000: 25% > cap
     assert.equal(o.discountPaise, 0);
     assert.deepEqual(o.notices, ["DISCOUNT_CLEARED"]);
-    o = await call((s) => removeItem(s, ctx(), { orderId: o.id, expectedVersion: 3, itemId: o.items[0]!.id }));
-    o = await call((s) => removeItem(s, ctx(), { orderId: o.id, expectedVersion: 4, itemId: o.items[0]!.id }));
+    let p = await draft([{ catalogueItemId: fx.tikka, quantity: 2 }]); // 20000
+    p = await call((s) => applyDiscount(s, ctx(), { orderId: p.id, expectedVersion: 1, kind: "fixed", amountPaise: 5000, capOverride: true })); // 25%
+    assert.equal(p.discount?.capOverride, true);
+    p = await call((s) => updateItem(s, ctx(), { orderId: p.id, expectedVersion: 2, itemId: p.items[0]!.id, quantity: 1 })); // 10000: 50%, approved
+    assert.equal(p.discountPaise, 5000);
+    assert.deepEqual(p.notices, []);
+  });
+
+  it("an empty draft cannot be discounted; a percent discount survives an emptied draft and returns with the next line", async () => {
+    let o = await draft([{ catalogueItemId: fx.tikka, quantity: 1 }]);
+    o = await call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 1, kind: "percent", bps: 1000 }));
+    o = await call((s) => removeItem(s, ctx(), { orderId: o.id, expectedVersion: 2, itemId: o.items[0]!.id }));
     assert.equal(o.items.length, 0);
     assert.equal(o.totalPaise, 0);
-    await rejectsWith(() => call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 5, kind: "fixed", amountPaise: 0 })), "VALIDATION_FAILED", "ORDER_EMPTY");
+    assert.equal(o.discountPaise, 0);
+    assert.equal(o.discount?.value, 1000, "the spec is still there");
+    assert.deepEqual(o.notices, []);
+    await rejectsWith(() => call((s) => applyDiscount(s, ctx(), { orderId: o.id, expectedVersion: 3, kind: "fixed", amountPaise: 0 })), "VALIDATION_FAILED", "ORDER_EMPTY");
+    o = await call((s) => addItem(s, ctx(), { orderId: o.id, expectedVersion: 3, item: { catalogueItemId: fx.soda, quantity: 1 } }));
+    assert.equal(o.discountPaise, 495);
   });
 
   it("removeDiscount restores the total; removing nothing is a no-op", async () => {
@@ -368,6 +501,8 @@ describe("discounts", () => {
     assert.ok(o.totalPaise < full);
     o = await call((s) => removeDiscount(s, ctx(), { orderId: o.id, expectedVersion: 2 }));
     assert.equal(o.totalPaise, full);
+    assert.equal(o.discount, null);
+    assert.deepEqual(await discountRow(o.id), { discount_paise: 0, discount_type: null, discount_value: null, discount_reason: null, discount_cap_override: false });
     assert.equal(o.version, 3);
     const same = await call((s) => removeDiscount(s, ctx(), { orderId: o.id, expectedVersion: 3 }));
     assert.equal(same.version, 3);
@@ -411,10 +546,23 @@ describe("fulfilment and booking link", () => {
     assert.equal(o.fulfilment?.type, "dine_in");
     assert.equal(o.fulfilment?.tableLabel, "Table 6");
     assert.equal(o.resourceId, fx.tableId);
+    assert.equal(o.fulfilment?.resourceId, fx.tableId);
+    const dbRow = await call((sql) => sql.query<{ resource_id: string | null }>("select resource_id from orders where tenant_id = $1 and id = $2", [fx.tenantId, o.id]));
+    assert.equal(dbRow.rows[0]?.resource_id, fx.tableId, "the table lives in orders.resource_id");
+    const addr = await call((sql) => sql.query<{ address: Record<string, unknown> }>("select address from fulfilments where tenant_id = $1 and order_id = $2", [fx.tenantId, o.id]));
+    assert.deepEqual(addr.rows[0]?.address, { tableLabel: "Table 6" }, "the fulfilment keeps only the label");
     o = await call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 1, fulfilment: { type: "dine_in", tableLabel: "Patio 2" } }));
     assert.equal(o.fulfilment?.tableLabel, "Patio 2");
     assert.equal(o.resourceId, null);
-    await rejectsWith(() => call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 2, fulfilment: { type: "dine_in" } })), "REQUIRED_FIELDS_MISSING", "TABLE_REQUIRED");
+    const cleared = await call((sql) => sql.query<{ resource_id: string | null }>("select resource_id from orders where tenant_id = $1 and id = $2", [fx.tenantId, o.id]));
+    assert.equal(cleared.rows[0]?.resource_id, null, "a label-only table clears the resource");
+    o = await call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 2, fulfilment: { type: "dine_in", resourceId: fx.tableId } }));
+    assert.equal(o.resourceId, fx.tableId);
+    o = await call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 3, fulfilment: { type: "pickup" } }));
+    assert.equal(o.resourceId, null, "leaving dine-in clears the table");
+    assert.equal(o.fulfilment?.resourceId, null);
+    o = await call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 4, fulfilment: { type: "dine_in", tableLabel: "Patio 2" } }));
+    await rejectsWith(() => call((s) => setFulfilment(s, ctx(), { orderId: o.id, expectedVersion: 5, fulfilment: { type: "dine_in" } })), "REQUIRED_FIELDS_MISSING", "TABLE_REQUIRED");
     // a resource that is not a table
     const staffId = await call((sql) => insert(sql, "resources", { tenant_id: fx.tenantId, type: "staff", name: "Chef" }));
     await rejectsWith(() => draft([{ catalogueItemId: fx.tikka, quantity: 1 }], { resourceId: staffId }), "VALIDATION_FAILED", "RESOURCE_NOT_A_TABLE");

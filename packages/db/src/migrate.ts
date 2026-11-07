@@ -20,7 +20,16 @@ const NAME_RE = /^\d{3,}_[a-z0-9_]+\.sql$/;
 // Arbitrary constant: serialises concurrent runners (two deploys, parallel test files).
 const ADVISORY_LOCK_KEY = 7_452_019_331;
 
-export async function loadMigrations(dir: string = DEFAULT_MIGRATIONS_DIR): Promise<MigrationFile[]> {
+/**
+ * Directory the runner reads. QENBEL_MIGRATIONS_DIR overrides it outside production, so a migration under development
+ * can be tried on a scratch database without sitting in migrations/ (where every other test run would apply it to the shared database).
+ */
+export function migrationsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.QENBEL_MIGRATIONS_DIR;
+  return override && env.NODE_ENV !== "production" ? path.resolve(override) : DEFAULT_MIGRATIONS_DIR;
+}
+
+export async function loadMigrations(dir: string = migrationsDir()): Promise<MigrationFile[]> {
   const names = (await readdir(dir)).filter((n) => n.endsWith(".sql")).sort();
   const files: MigrationFile[] = [];
   for (const name of names) {

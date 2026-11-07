@@ -79,11 +79,24 @@ export function tx<T>(env: Env, ctx: EngineContext, fn: (c: PoolClient) => Promi
 
 export async function createTenant(env: Env, o: { pack?: string; timezone?: string; label?: string } = {}): Promise<string> {
   const slug = `${o.label ?? "eb"}-${randomUUID().slice(0, 8)}`;
-  const res = await env.app.query<{ id: string }>(
-    "select platform_create_tenant($1, $2, 'central', $3, '1.0.0', $4) as id",
-    [slug, `Test ${slug}`, o.pack ?? "salon", o.timezone ?? "Asia/Kolkata"],
-  );
-  return (res.rows[0] as { id: string }).id;
+  // Since migration 017 the runtime role cannot call platform_create_tenant (only qenbel_platform_ops can). The suite has
+  // no ops login, so the owner role steps into qenbel_platform for the one statement, as the migrations themselves do.
+  const client = await env.owner.connect();
+  try {
+    await client.query("begin");
+    await client.query("set local role qenbel_platform");
+    const res = await client.query<{ id: string }>(
+      "select platform_create_tenant($1, $2, 'central', $3, '1.0.0', $4) as id",
+      [slug, `Test ${slug}`, o.pack ?? "salon", o.timezone ?? "Asia/Kolkata"],
+    );
+    await client.query("commit");
+    return (res.rows[0] as { id: string }).id;
+  } catch (err) {
+    await client.query("rollback").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function insert(c: PoolClient, table: string, row: Record<string, unknown>): Promise<string> {
@@ -95,6 +108,32 @@ export async function insert(c: PoolClient, table: string, row: Record<string, u
     Object.values(all),
   );
   return id;
+}
+
+/** Block a resource for [startsAt, endsAt) through resource_time_off. */
+export async function addTimeOff(c: PoolClient, tenantId: string, resourceId: string, startsAt: string, endsAt: string): Promise<string> {
+  return insert(c, "resource_time_off", { tenant_id: tenantId, resource_id: resourceId, starts_at: startsAt, ends_at: endsAt });
+}
+
+/** A recurring break through resource_breaks. `weekdays` default to every day (0 = Sunday). */
+export async function addBreak(
+  c: PoolClient,
+  tenantId: string,
+  resourceId: string,
+  start: string,
+  end: string,
+  weekdays: readonly number[] = [0, 1, 2, 3, 4, 5, 6],
+): Promise<void> {
+  for (const weekday of weekdays) {
+    await insert(c, "resource_breaks", { tenant_id: tenantId, resource_id: resourceId, weekday, start_time: start, end_time: end });
+  }
+}
+
+/** Restrict a resource to these services through resource_services. */
+export async function allowServices(c: PoolClient, tenantId: string, resourceId: string, catalogueItemIds: readonly string[]): Promise<void> {
+  for (const id of catalogueItemIds) {
+    await insert(c, "resource_services", { tenant_id: tenantId, resource_id: resourceId, catalogue_item_id: id });
+  }
 }
 
 export const json = (v: unknown): string => JSON.stringify(v);

@@ -1,8 +1,10 @@
 // Draft orders: create (idempotent), edit lines, discount, fulfilment, notes. Prices come ONLY from the catalogue.
 // Every function: parse strict input, prove the tenant session, lock the order row, check the version, change, reprice,
-// write an audit row. A discount is cleared by any line change (the order stores only the amount; see README).
+// write an audit row. The discount spec is persisted on the order and recomputed after every line change; line tax
+// rates are frozen on the lines when they are added (see README).
 import { toPaise } from "@qenbel/db";
 import {
+  Channel,
   ErrorCode,
   FulfilmentType,
   OrderStatus,
@@ -28,6 +30,7 @@ import {
   type ResolvedLine,
 } from "./lookups.ts";
 import { loadPackContext } from "./pack.ts";
+import { actsForCustomer, limitsFor, requireStaff, requireSubject, subjectCustomerId } from "./scope.ts";
 import {
   MAX_LINES_PER_ORDER,
   MAX_QUANTITY_PER_LINE,
@@ -48,30 +51,32 @@ import {
   type UpdateItemInput,
   type UpdateOrderNotesInput,
 } from "./schemas.ts";
-import { ORDER_ROUNDING_MODE, MAX_ORDER_TOTAL_PAISE, computeTotals, discountAmount, discountBpsOfSubtotal } from "./totals.ts";
+import { DISCOUNT_APPROVAL_CAP_BPS, ORDER_ROUNDING_MODE, computeTotals, discountAmount, discountBpsOfSubtotal } from "./totals.ts";
 import { buildOrderView, loadItemRows, loadOrderRow, type ItemRow, type OrderRow, type OrderView } from "./view.ts";
 import { assertDraft, bumpVersion, insertItem, invalidState, lockOrder, repriceDraft, upsertFulfilment } from "./write.ts";
 
-/** Discounts above this share of the subtotal need the override flag (set by the API from a permission). */
-export const DISCOUNT_APPROVAL_CAP_BPS = 2_000;
+export { DISCOUNT_APPROVAL_CAP_BPS };
+
+/** Most drafts one verified customer can start in 24 hours on a customer channel. */
+export const MAX_DRAFTS_PER_CUSTOMER_PER_DAY = 20;
 
 /** Fulfilment details may change until preparation starts. */
 const FULFILMENT_EDITABLE: readonly OrderStatus[] = [OrderStatus.DRAFT, OrderStatus.PLACED, OrderStatus.ACCEPTED];
 
-function lineKey(l: { catalogueItemId: string; variantId: string | null; note: string | null; unitPricePaise: number }): string {
-  return `${l.catalogueItemId}|${l.variantId ?? ""}|${l.note ?? ""}|${l.unitPricePaise}`;
+function lineKey(l: { catalogueItemId: string; variantId: string | null; note: string | null; unitPricePaise: number; taxRateBps: number }): string {
+  return `${l.catalogueItemId}|${l.variantId ?? ""}|${l.note ?? ""}|${l.unitPricePaise}|${l.taxRateBps}`;
 }
 
-/** Same item, variant, note and price become one line. */
-function mergeLines(lines: ResolvedLine[]): ResolvedLine[] {
+/** Same item, variant, note, price and frozen tax rate become one line. */
+function mergeLines(lines: ResolvedLine[], maxQuantity: number): ResolvedLine[] {
   const merged = new Map<string, ResolvedLine>();
   for (const line of lines) {
     const key = lineKey(line);
     const existing = merged.get(key);
     if (existing) {
       existing.quantity += line.quantity;
-      if (existing.quantity > MAX_QUANTITY_PER_LINE) {
-        throw orderError(ErrorCode.VALIDATION_FAILED, "QUANTITY_LIMIT", `At most ${MAX_QUANTITY_PER_LINE} of one item.`);
+      if (existing.quantity > maxQuantity) {
+        throw orderError(ErrorCode.VALIDATION_FAILED, "QUANTITY_LIMIT", `At most ${maxQuantity} of one item.`);
       }
     } else {
       merged.set(key, { ...line });
@@ -111,6 +116,13 @@ export async function createOrderDraft(sql: SqlClient, ctx: EngineContext, rawIn
   const input = parseInput(createOrderDraftInputSchema, rawInput);
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
+  // On a customer channel the order belongs to the verified subject. No subject, no draft. A customer id in the input
+  // may only repeat the subject's own.
+  const forCustomer = actsForCustomer(ctx);
+  const subject = forCustomer ? requireSubject(ctx) : undefined;
+  if (subject !== undefined && input.customerId !== undefined && input.customerId !== subject) throw notFound("CUSTOMER_NOT_FOUND");
+  const owner = subject ?? input.customerId;
+  const limits = limitsFor(ctx);
   try {
     return await withIdempotency(
       sql,
@@ -118,15 +130,39 @@ export async function createOrderDraft(sql: SqlClient, ctx: EngineContext, rawIn
       "engine:orders:createOrderDraft",
       input,
       async () => {
-        const lines = mergeLines(await resolveLines(sql, ctx, input.items));
-        if (lines.length > MAX_LINES_PER_ORDER) {
-          throw orderError(ErrorCode.VALIDATION_FAILED, "LINE_LIMIT", `At most ${MAX_LINES_PER_ORDER} lines.`);
+        if (input.items.some((i) => i.quantity > limits.maxQuantityPerLine)) {
+          throw orderError(ErrorCode.VALIDATION_FAILED, "QUANTITY_LIMIT", `At most ${limits.maxQuantityPerLine} of one item.`);
+        }
+        const lines = mergeLines(await resolveLines(sql, ctx, input.items), limits.maxQuantityPerLine);
+        if (lines.length > limits.maxLines) {
+          throw orderError(ErrorCode.VALIDATION_FAILED, "LINE_LIMIT", `At most ${limits.maxLines} lines.`);
+        }
+        if (lines.reduce((n, l) => n + l.quantity, 0) > limits.maxUnits) {
+          throw orderError(ErrorCode.VALIDATION_FAILED, "UNIT_LIMIT", `At most ${limits.maxUnits} items in one order.`);
         }
         const currency = (lines[0] as ResolvedLine).currency;
         assertSameCurrency(currency, lines);
 
-        if (input.customerId) await requireCustomer(sql, ctx, input.customerId);
-        if (input.bookingId) await assertBookingLink(sql, ctx, input.bookingId, input.customerId ?? null);
+        if (owner) await requireCustomer(sql, ctx, owner);
+        if (input.bookingId) {
+          if (forCustomer) {
+            // A customer may only link their own booking; anyone else's looks absent.
+            const booking = await requireBooking(sql, ctx, input.bookingId);
+            if (booking.customerId !== owner) throw notFound("BOOKING_NOT_FOUND");
+          } else {
+            await assertBookingLink(sql, ctx, input.bookingId, owner ?? null);
+          }
+        }
+        if (forCustomer && owner) {
+          // A draft is cheap to make and never expires: cap how many one customer can open per day.
+          const recent = await sql.query<{ n: string }>(
+            "select count(*) as n from orders where tenant_id = $1 and customer_id = $2 and created_at > $3::timestamptz - interval '24 hours'",
+            [ctx.tenantId, owner, ctx.now()],
+          );
+          if (Number(recent.rows[0]?.n ?? 0) >= MAX_DRAFTS_PER_CUSTOMER_PER_DAY) {
+            throw orderError(ErrorCode.RATE_LIMITED, "DRAFT_LIMIT", "Too many orders started today. Try again later.");
+          }
+        }
 
         let impliedTable: string | undefined;
         if (input.resourceId) {
@@ -136,22 +172,21 @@ export async function createOrderDraft(sql: SqlClient, ctx: EngineContext, rawIn
           }
         }
 
-        const totals = money(() =>
-          computeTotals(lines, null),
-        );
+        const totals = money(() => computeTotals(lines, null));
         const orderId = ctx.newId();
         const locationId = await defaultLocationId(sql, ctx);
         await sql.query(
           `insert into orders
-             (id, tenant_id, location_id, customer_id, booking_id, status, source_channel, payment_status,
+             (id, tenant_id, location_id, customer_id, booking_id, conversation_id, status, source_channel, payment_status,
               subtotal_paise, tax_paise, discount_paise, total_paise, currency, notes)
-           values ($1, $2, $3, $4, $5, 'DRAFT', $6, 'unpaid', $7, $8, 0, $9, $10, $11)`,
+           values ($1, $2, $3, $4, $5, $6, 'DRAFT', $7, 'unpaid', $8, $9, 0, $10, $11, $12)`,
           [
             orderId,
             ctx.tenantId,
             locationId,
-            input.customerId ?? null,
+            owner ?? null,
             input.bookingId ?? null,
+            ctx.subject?.conversationId ?? null,
             ctx.actor.channel,
             totals.subtotalPaise,
             totals.taxPaise,
@@ -172,6 +207,7 @@ export async function createOrderDraft(sql: SqlClient, ctx: EngineContext, rawIn
           lines: lines.length,
           subtotalPaise: totals.subtotalPaise,
           totalPaise: totals.totalPaise,
+          subjectCustomerId: subjectCustomerId(ctx) ?? null,
         });
         return orderId;
       },
@@ -184,11 +220,23 @@ export async function createOrderDraft(sql: SqlClient, ctx: EngineContext, rawIn
 
 // ---- lines ---------------------------------------------------------------------------------------------
 
+/**
+ * Reprice after a line change. The stored discount spec is recomputed on the new subtotal; it is dropped (notice
+ * DISCOUNT_CLEARED) only if it became invalid: a fixed amount above the new subtotal, or above the cap without approval.
+ */
 async function repriceAndView(sql: SqlClient, ctx: EngineContext, order: OrderRow, action: string, details: Record<string, unknown>): Promise<OrderView> {
-  const hadDiscount = toPaise(order.discount_paise) > 0;
-  const updated = await repriceDraft(sql, ctx, order, null);
-  const notices = hadDiscount ? ["DISCOUNT_CLEARED"] : [];
-  await audit(sql, ctx, action, "order", order.id, { ...details, discountCleared: hadDiscount, totalPaise: toPaise(updated.total_paise) });
+  const units = await sql.query<{ n: string }>("select coalesce(sum(quantity), 0) as n from order_items where tenant_id = $1 and order_id = $2", [ctx.tenantId, order.id]);
+  if (Number(units.rows[0]?.n ?? 0) > limitsFor(ctx).maxUnits) {
+    throw orderError(ErrorCode.VALIDATION_FAILED, "UNIT_LIMIT", `At most ${limitsFor(ctx).maxUnits} items in one order.`);
+  }
+  const { order: updated, discountCleared } = await repriceDraft(sql, ctx, order);
+  const notices = discountCleared ? ["DISCOUNT_CLEARED"] : [];
+  await audit(sql, ctx, action, "order", order.id, {
+    ...details,
+    discountCleared,
+    discountPaise: toPaise(updated.discount_paise),
+    totalPaise: toPaise(updated.total_paise),
+  });
   const packCtx = await loadPackContext(sql, ctx, false);
   return buildOrderView(sql, ctx, packCtx, updated, notices);
 }
@@ -196,6 +244,7 @@ async function repriceAndView(sql: SqlClient, ctx: EngineContext, order: OrderRo
 /** Add a line to a draft. The same item/variant/note/price merges into the existing line (quantity capped at 999). */
 export async function addItem(sql: SqlClient, ctx: EngineContext, rawInput: AddItemInput): Promise<OrderView> {
   const input = parseInput(addItemInputSchema, rawInput);
+  requireStaff(ctx, "addItem");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
@@ -212,6 +261,7 @@ export async function addItem(sql: SqlClient, ctx: EngineContext, rawInput: AddI
           variantId: i.variant_id,
           note: i.notes,
           unitPricePaise: toPaise(i.unit_price_paise),
+          taxRateBps: i.tax_rate_bps,
         }) === lineKey(resolved),
     );
     if (match) {
@@ -248,6 +298,7 @@ async function requireOrderItem(sql: SqlClient, ctx: EngineContext, orderId: str
 /** Change a line's quantity or note. The unit price is never touched: it stays the snapshot taken when it was added. */
 export async function updateItem(sql: SqlClient, ctx: EngineContext, rawInput: UpdateItemInput): Promise<OrderView> {
   const input = parseInput(updateItemInputSchema, rawInput);
+  requireStaff(ctx, "updateItem");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
@@ -272,6 +323,7 @@ export async function updateItem(sql: SqlClient, ctx: EngineContext, rawInput: U
 
 export async function removeItem(sql: SqlClient, ctx: EngineContext, rawInput: RemoveItemInput): Promise<OrderView> {
   const input = parseInput(removeItemInputSchema, rawInput);
+  requireStaff(ctx, "removeItem");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
@@ -287,6 +339,7 @@ export async function removeItem(sql: SqlClient, ctx: EngineContext, rawInput: R
 
 export async function updateOrderNotes(sql: SqlClient, ctx: EngineContext, rawInput: UpdateOrderNotesInput): Promise<OrderView> {
   const input = parseInput(updateOrderNotesInputSchema, rawInput);
+  requireStaff(ctx, "updateOrderNotes");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
@@ -308,12 +361,14 @@ export async function updateOrderNotes(sql: SqlClient, ctx: EngineContext, rawIn
 // ---- discount ---------------------------------------------------------------------------------------------
 
 /**
- * Apply a discount to a draft (replaces any earlier one). Hard rule: never more than the subtotal. Policy cap:
+ * Apply a discount to a draft (replaces any earlier one). The spec (fixed paise or percent bps), the reason and whether
+ * the cap was overridden are stored on the order, so later line edits recompute the amount. Hard rule: never more than the subtotal. Policy cap:
  * above DISCOUNT_APPROVAL_CAP_BPS of the subtotal it needs `capOverride: true`, which the API sets only for a
  * principal with the override permission. Who, how much and whether the override was used go to the audit log.
  */
 export async function applyDiscount(sql: SqlClient, ctx: EngineContext, rawInput: ApplyDiscountInput): Promise<OrderView> {
   const input = parseInput(applyDiscountInputSchema, rawInput);
+  requireStaff(ctx, "applyDiscount");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
@@ -327,10 +382,16 @@ export async function applyDiscount(sql: SqlClient, ctx: EngineContext, rawInput
     const effectiveBps = discountBpsOfSubtotal(amount, subtotal);
     const overCap = effectiveBps > DISCOUNT_APPROVAL_CAP_BPS;
     const overrideFlag = input.capOverride === true;
+    // An override is a staff decision made on the dashboard; no other channel can ever carry it.
+    if (overrideFlag && ctx.actor.channel !== Channel.DASHBOARD) {
+      throw orderError(ErrorCode.FORBIDDEN, "CAP_OVERRIDE_NOT_ALLOWED", "Only staff on the dashboard can approve this discount.");
+    }
     if (overCap && !overrideFlag) {
       throw orderError(ErrorCode.FORBIDDEN, "DISCOUNT_CAP_EXCEEDED", "That discount needs approval.", { capBps: DISCOUNT_APPROVAL_CAP_BPS });
     }
-    const updated = await repriceDraft(sql, ctx, order, spec);
+    const { order: updated } = await repriceDraft(sql, ctx, order, {
+      discount: { spec, reason: input.reason ?? null, capOverride: overCap && overrideFlag },
+    });
     await audit(sql, ctx, "order.discount_applied", "order", order.id, {
       kind: input.kind,
       value: input.kind === "fixed" ? input.amountPaise : input.bps,
@@ -351,13 +412,14 @@ export async function applyDiscount(sql: SqlClient, ctx: EngineContext, rawInput
 
 export async function removeDiscount(sql: SqlClient, ctx: EngineContext, rawInput: RemoveDiscountInput): Promise<OrderView> {
   const input = parseInput(removeDiscountInputSchema, rawInput);
+  requireStaff(ctx, "removeDiscount");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {
     const order = await lockOrder(sql, ctx, input.orderId, input.expectedVersion);
     assertDraft(order);
-    if (toPaise(order.discount_paise) === 0) return await finish(sql, ctx, order.id);
-    const updated = await repriceDraft(sql, ctx, order, null);
+    if (order.discount_type === null && toPaise(order.discount_paise) === 0) return await finish(sql, ctx, order.id);
+    const { order: updated } = await repriceDraft(sql, ctx, order, { discount: null });
     await audit(sql, ctx, "order.discount_removed", "order", order.id, { totalPaise: toPaise(updated.total_paise) });
     const packCtx = await loadPackContext(sql, ctx, false);
     return await buildOrderView(sql, ctx, packCtx, updated);
@@ -374,6 +436,7 @@ export async function removeDiscount(sql: SqlClient, ctx: EngineContext, rawInpu
  */
 export async function setFulfilment(sql: SqlClient, ctx: EngineContext, rawInput: SetFulfilmentInput): Promise<OrderView> {
   const input = parseInput(setFulfilmentInputSchema, rawInput);
+  requireStaff(ctx, "setFulfilment");
   await assertTenantSession(sql, ctx);
   await loadPackContext(sql, ctx, true);
   try {

@@ -1,6 +1,6 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { generateSlots, type SqlClient } from "@qenbel/shared";
+import { generateSlots, type SqlClient, type WeeklyHours } from "@qenbel/shared";
 import {
   addResourceTimeOff, archiveLocation, archiveCatalogueItem, archiveResource, createCatalogueItem, createHoliday, createLocation, createResource,
   createVariant, generateAllSlots, generateResourceSlots, intersectIntervals, loadAvailabilityInputs, peakUnits, setLocationHours,
@@ -23,7 +23,7 @@ const TUE = "2031-01-07";
 const week = (days: Record<string, Array<[string, string]>>) => {
   const w: Record<string, Array<{ start: string; end: string }>> = { sun: [], mon: [], tue: [], wed: [], thu: [], fri: [], sat: [] };
   for (const [d, list] of Object.entries(days)) w[d] = list.map(([start, end]) => ({ start, end }));
-  return w;
+  return w as unknown as WeeklyHours;
 };
 const WORKDAYS = (start = "09:00", end = "18:00") => week({ mon: [[start, end]], tue: [[start, end]], wed: [[start, end]], thu: [[start, end]], fri: [[start, end]] });
 const ist = (date: string, hm: string): Date => new Date(`${date}T${hm}:00+05:30`);
@@ -77,13 +77,14 @@ describe("shape of the inputs", () => {
     assert.deepEqual(r.hours.sat, []);
     assert.deepEqual(r.holidays, []);
     assert.deepEqual(r.dateOverrides, {});
-    assert.deepEqual(r.breaks, []);
+    assert.deepEqual(r.breaks, week({}));
+    assert.equal(r.hasOwnBreaks, false);
     assert.deepEqual(r.timeOff, []);
     assert.deepEqual(r.allocations, []);
     assert.equal(r.allocationMode, "exclusive");
 
     // The raw fields are exactly what shared generateSlots takes.
-    const direct = generateSlots({ timezone: inputs.timezone, date: MON, hours: r.hours, breaks: r.breaks, holidays: r.holidays, allocations: r.allocations,
+    const direct = generateSlots({ timezone: inputs.timezone, date: MON, hours: r.hours, breaks: r.breaks.mon, holidays: r.holidays, allocations: r.allocations,
       durationMinutes: inputs.service.durationMinutes, bufferMinutes: inputs.service.bufferMinutes, stepMinutes: 30 });
     assert.equal(direct.length, 18);
     assert.deepEqual(slotsOf(inputs, w.a), direct);
@@ -145,7 +146,10 @@ describe("breaks, schedules and time off", () => {
     const w = await world("av-rbreak");
     await call(db, w.ctx, setResourceBreaks, { resourceId: w.a, breaks: [{ start: "15:00", end: "15:30" }] });
     const inputs = await load(w);
-    assert.deepEqual(inputs.resources.find((r) => r.resourceId === w.a)!.breaks, [{ start: "15:00", end: "15:30" }]);
+    const own = inputs.resources.find((r) => r.resourceId === w.a)!;
+    assert.equal(own.hasOwnBreaks, true);
+    for (const d of ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const) assert.deepEqual(own.breaks[d], [{ start: "15:00", end: "15:30" }]);
+    assert.equal(inputs.resources.find((r) => r.resourceId === w.b)!.hasOwnBreaks, false);
     assert.ok(!starts(slotsOf(inputs, w.a)).includes("15:00"));
     assert.ok(starts(slotsOf(inputs, w.b)).includes("15:00"), "the other resource has no break");
     // a 30-minute service starting at 14:45 would overlap the break
@@ -433,15 +437,29 @@ describe("time zones", () => {
 describe("efficiency", () => {
   test("the number of queries does not grow with the number of resources", async () => {
     const w = await world("av-queries");
-    for (let i = 0; i < 25; i++) await call(db, w.ctx, createResource, { type: "staff", name: `Extra ${i}`, locationId: w.loc });
+    const measure = async () => {
+      let queries = 0;
+      const out = await tx(db, w.t, async (c) => {
+        const spy: SqlClient = { query: ((text: string, values?: readonly unknown[]) => { queries++; return c.query(text, values as unknown[]); }) as SqlClient["query"] };
+        return loadAvailabilityInputs(spy, w.ctx, { locationId: w.loc, serviceId: w.service, from: MON, to: "2031-01-12" });
+      });
+      return { queries, resources: out.resources.length };
+    };
+    await call(db, w.ctx, setResourceBreaks, { resourceId: w.a, breaks: [{ start: "13:00", end: "14:00" }] });
+    await call(db, w.ctx, addResourceTimeOff, { resourceId: w.a, startsAt: ist(MON, "10:00").toISOString(), endsAt: ist(MON, "11:00").toISOString() });
+    const small = await measure();
+    for (let i = 0; i < 25; i++) {
+      const r = await call(db, w.ctx, createResource, { type: "staff", name: `Extra ${i}`, locationId: w.loc });
+      await call(db, w.ctx, setResourceBreaks, { resourceId: r.id, weekly: week({ mon: [["12:00", "12:30"]], sat: [["12:00", "12:30"]] }) });
+      await call(db, w.ctx, addResourceTimeOff, { resourceId: r.id, startsAt: ist(TUE, "10:00").toISOString(), endsAt: ist(TUE, "11:00").toISOString() });
+      if (i % 2 === 0) await call(db, w.ctx, setResourceServices, { resourceId: r.id, serviceIds: [w.service] });
+    }
     await call(db, w.ctx, setResourceSchedule, { resourceId: w.a, hours: week({ mon: [["10:00", "16:00"]] }) } as never);
-    let queries = 0;
-    const counted = await tx(db, w.t, async (c) => {
-      const spy: SqlClient = { query: ((text: string, values?: readonly unknown[]) => { queries++; return c.query(text, values as unknown[]); }) as SqlClient["query"] };
-      return loadAvailabilityInputs(spy, w.ctx, { locationId: w.loc, serviceId: w.service, from: MON, to: "2031-01-12" });
-    });
-    assert.equal(counted.resources.length, 27);
-    assert.ok(queries <= 8, `expected a constant number of queries, got ${queries}`);
+    const big = await measure();
+    assert.equal(small.resources, 2);
+    assert.equal(big.resources, 27);
+    assert.equal(big.queries, small.queries, "the query count does not depend on the number of resources");
+    assert.ok(big.queries <= 10, `expected a small constant number of queries, got ${big.queries}`);
   });
 });
 
@@ -472,7 +490,8 @@ describe("tenant isolation", () => {
     const inputs = await call(db, a.ctx, loadAvailabilityInputs, { locationId: a.loc, serviceId: a.service, from: MON });
     for (const r of inputs.resources) {
       assert.deepEqual(r.holidays, []);
-      assert.deepEqual(r.breaks, []);
+      assert.deepEqual(r.breaks, week({}));
+      assert.equal(r.hasOwnBreaks, false);
       assert.deepEqual(r.timeOff, []);
     }
     assert.equal(generateAllSlots(inputs, { stepMinutes: 30 }).length, 2 * 18);

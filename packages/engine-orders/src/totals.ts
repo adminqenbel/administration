@@ -11,7 +11,7 @@
 //   tax           = sum of line taxes
 //   total         = subtotal - discount + tax                       (matches the orders_total_consistent CHECK)
 // A discount therefore reduces the taxable value, as GST does for a trade discount.
-import { RoundingMode, addPaise, divideRound, multiplyPaise, percentOf, type Paise } from "@qenbel/shared";
+import { DiscountType, RoundingMode, addPaise, divideRound, multiplyPaise, percentOf, type Paise } from "@qenbel/shared";
 
 /** Rounding used for every tax and percentage discount on an order. Explicit, never implicit. */
 export const ORDER_ROUNDING_MODE: RoundingMode = RoundingMode.HALF_UP;
@@ -124,4 +124,22 @@ export function computeTotals(
 export function discountBpsOfSubtotal(discountPaise: Paise, subtotalPaise: Paise): number {
   if (subtotalPaise === 0) return 0;
   return Number(divideRound(BigInt(discountPaise) * 10_000n, BigInt(subtotalPaise), RoundingMode.CEIL));
+}
+
+/** Discounts above this share of the subtotal need the override flag (set by the API from a permission). */
+export const DISCOUNT_APPROVAL_CAP_BPS = 2_000;
+
+/** The persisted form of a discount spec: `orders.discount_type` + `orders.discount_value`. */
+export interface StoredDiscount {
+  type: DiscountType;
+  /** Paise for `fixed`, basis points for `percent_bps`. */
+  value: number;
+}
+
+export function specToStored(spec: DiscountSpec): StoredDiscount {
+  return spec.kind === "fixed" ? { type: DiscountType.FIXED, value: spec.amountPaise } : { type: DiscountType.PERCENT_BPS, value: spec.bps };
+}
+
+export function specFromStored(type: string, value: number): DiscountSpec {
+  return type === DiscountType.FIXED ? { kind: "fixed", amountPaise: value } : { kind: "percent", bps: value };
 }

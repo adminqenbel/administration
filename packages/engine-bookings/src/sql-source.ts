@@ -1,26 +1,17 @@
 // Private SQL reader for availability inputs, from the real tables:
 // locations, business_hours, holidays, resources, resource_schedules, booking_allocations.
 //
-// The schema has no tables yet for staff time off, daily breaks or "which services a resource can do".
-// Until the db agent adds them (see docs/CONTRACT-REQUESTS.md) they are read from resources.attributes:
-//   attributes.serviceIds : string[]                       resource can only serve these catalogue items (absent = any)
-//   attributes.breaks     : [{ start: "13:00", end: "14:00" }]   daily, local time
-//   attributes.timeOff    : [{ start: ISO, end: ISO }]            blocked instants
-// Data that cannot be parsed makes the resource unavailable (fail closed), never available.
-import { z } from "zod";
-import {
-  idSchema,
-  instantSchema,
-  timeIntervalSchema,
-  type EngineContext,
-  type ResourceType,
-  type SqlClient,
-  type TimeInterval,
-  type TimeRange,
-} from "@qenbel/shared";
+// Staff time off, weekly breaks and "which services a resource can do" come from the tables added in migration 013:
+//   resource_time_off(resource_id, starts_at, ends_at)                        blocked interval [starts_at, ends_at)
+//   resource_breaks(resource_id, weekday 0=Sunday..6, start_time, end_time)   recurring break, location-local time
+//   resource_services(resource_id, catalogue_item_id)                         no rows = any service of the matching type
+// The old resources.attributes keys (timeOff, breaks, serviceIds) are neither read nor written any more.
+// Break or time-off rows that cannot be understood make the resource unavailable (fail closed), never available.
+import { timeIntervalSchema, type EngineContext, type ResourceType, type SqlClient, type TimeRange } from "@qenbel/shared";
 import type {
   AllocationRow,
   AvailabilityDataSource,
+  BreakRow,
   CandidateQuery,
   HolidayRow,
   HourRow,
@@ -46,17 +37,6 @@ interface ResourceRow {
   allocation_mode: "exclusive" | "shared";
   capacity_units: number;
   min_units: number;
-  attributes: unknown;
-}
-
-const serviceIdsSchema = z.array(idSchema).max(500);
-const breaksSchema = z.array(timeIntervalSchema).max(10);
-const timeOffSchema = z
-  .array(z.object({ start: instantSchema, end: instantSchema }).passthrough())
-  .max(2000);
-
-function attrs(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 async function loadLocations(sql: SqlClient, ctx: EngineContext): Promise<LocationRow[]> {
@@ -91,11 +71,21 @@ export const sqlAvailabilityDataSource: AvailabilityDataSource = {
       where += ` and id = any($${params.length}::uuid[])`;
     }
     const res = await sql.query<ResourceRow>(
-      `select id, name, type, location_id, allocation_mode, capacity_units, min_units, attributes
+      `select id, name, type, location_id, allocation_mode, capacity_units, min_units
          from resources where ${where} order by name, id`,
       params,
     );
     const locations = await loadLocations(sql, ctx);
+    // A resource that lists services may serve only those. A resource with no resource_services rows serves any.
+    const serves = new Map<string, boolean>();
+    if (query.catalogueItemId && res.rows.length > 0) {
+      const svc = await sql.query<{ resource_id: string; serves: boolean }>(
+        `select resource_id, bool_or(catalogue_item_id = $3::uuid) as serves
+           from resource_services where tenant_id = $1 and resource_id = any($2::uuid[]) group by resource_id`,
+        [ctx.tenantId, res.rows.map((r) => r.id), query.catalogueItemId],
+      );
+      for (const r of svc.rows) serves.set(r.resource_id, r.serves === true);
+    }
     const explicit = query.resourceIds !== undefined;
     const out: ResourceCandidate[] = [];
     for (const row of res.rows) {
@@ -103,10 +93,8 @@ export const sqlAvailabilityDataSource: AvailabilityDataSource = {
       let reason: ResourceCandidate["reason"];
       if (!query.allowedTypes.includes(row.type) || (query.requiredType && row.type !== query.requiredType)) {
         reason = "type";
-      } else if (query.catalogueItemId) {
-        const ids = serviceIdsSchema.safeParse(attrs(row.attributes).serviceIds);
-        const declared = attrs(row.attributes).serviceIds !== undefined;
-        if (declared && (!ids.success || !ids.data.includes(query.catalogueItemId))) reason = "service";
+      } else if (query.catalogueItemId && serves.get(row.id) === false) {
+        reason = "service";
       }
       if (reason === undefined && query.partySize) {
         // Tables: the party must fit one table (several tables are booked with resourceIds). Shared: seats left.
@@ -128,9 +116,18 @@ export const sqlAvailabilityDataSource: AvailabilityDataSource = {
     const locationIds = [...new Set(resources.map((r) => r.locationId).filter((x): x is string => x !== null))];
 
     // Sequential: one client runs one query at a time (pg deprecates overlapping queries on a client).
-    const attrRes = await sql.query<{ id: string; attributes: unknown }>(
-      "select id, attributes from resources where tenant_id = $1 and id = any($2::uuid[])",
+    const breakRes = await sql.query<{ resource_id: string; weekday: number; s: string; e: string; ragged: boolean }>(
+      `select resource_id, weekday, to_char(start_time, 'HH24:MI') as s, to_char(end_time, 'HH24:MI') as e,
+              (extract(second from start_time) <> 0 or extract(second from end_time) <> 0) as ragged
+         from resource_breaks where tenant_id = $1 and resource_id = any($2::uuid[]) order by weekday, start_time`,
       [ctx.tenantId, resourceIds],
+    );
+    const offRes = await sql.query<{ resource_id: string; s: Date | string; e: Date | string }>(
+      `select resource_id, starts_at as s, ends_at as e
+         from resource_time_off
+        where tenant_id = $1 and resource_id = any($2::uuid[]) and starts_at < $4::timestamptz and ends_at > $3::timestamptz
+        order by starts_at`,
+      [ctx.tenantId, resourceIds, window.from.toISOString(), window.to.toISOString()],
     );
     const hoursRes = await sql.query<{ location_id: string; weekday: number; s: string; e: string }>(
       `select location_id, weekday, to_char(open_time, 'HH24:MI') as s, to_char(close_time, 'HH24:MI') as e
@@ -160,26 +157,33 @@ export const sqlAvailabilityDataSource: AvailabilityDataSource = {
       [ctx.tenantId, resourceIds, ctx.now().toISOString(), window.from.toISOString(), window.to.toISOString()],
     );
 
-    const attrById = new Map(attrRes.rows.map((r) => [r.id, attrs(r.attributes)]));
-
     return resources.map((resource): ResourceAvailabilityInputs => {
-      const a = attrById.get(resource.id) ?? {};
       let unreadable = false;
 
-      let breaks: TimeInterval[] | null = null;
-      if (a.breaks !== undefined) {
-        const parsed = breaksSchema.safeParse(a.breaks);
-        if (parsed.success) breaks = parsed.data;
-        else unreadable = true;
-      }
-      let timeOff: TimeRange[] = [];
-      if (a.timeOff !== undefined) {
-        const parsed = timeOffSchema.safeParse(a.timeOff);
-        if (parsed.success) {
-          timeOff = parsed.data.map((t) => ({ start: new Date(t.start).toISOString(), end: new Date(t.end).toISOString() }));
-        } else {
+      // No rows: the tenant/pack breaks apply. Any row: the resource's own breaks replace them on every weekday.
+      let breaks: BreakRow[] | null = null;
+      for (const r of breakRes.rows) {
+        if (r.resource_id !== resource.id) continue;
+        breaks ??= [];
+        const weekday = Number(r.weekday);
+        const interval = timeIntervalSchema.safeParse({ start: r.s, end: r.e });
+        if (r.ragged || !interval.success || !Number.isInteger(weekday) || weekday < 0 || weekday > 6) {
           unreadable = true;
+          continue;
         }
+        breaks.push({ weekday, start: interval.data.start, end: interval.data.end });
+      }
+
+      const timeOff: TimeRange[] = [];
+      for (const r of offRes.rows) {
+        if (r.resource_id !== resource.id) continue;
+        const start = new Date(r.s).getTime();
+        const end = new Date(r.e).getTime();
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+          unreadable = true;
+          continue;
+        }
+        timeOff.push({ start: new Date(start).toISOString(), end: new Date(end).toISOString() });
       }
 
       const businessHours: HourRow[] = hoursRes.rows

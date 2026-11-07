@@ -94,6 +94,22 @@ describe("recordPayment", () => {
     assert.equal((await view(o.id)).version, o.version);
   });
 
+  it("a refund queues payment.refunded once (never payment.completed), with ids and amounts only", async () => {
+    const o = await placed();
+    await pay(o.id, 4000);
+    const r = await refund(o.id, 1500);
+    const ev = await call((s) => s.query<{ type: string; payload: Record<string, unknown> }>("select type, payload from outbox_events where tenant_id = $1 and aggregate_id = $2", [fx.tenantId, r.payment.id]));
+    assert.deepEqual(ev.rows.map((e) => e.type), ["payment.refunded"]);
+    assert.equal(ev.rows[0]?.payload.amountPaise, 1500);
+    assert.equal(ev.rows[0]?.payload.kind, "refund");
+    assert.equal(ev.rows[0]?.payload.orderId, o.id);
+    assert.ok(!/Asha|@example|\+91/.test(JSON.stringify(ev.rows[0]?.payload)));
+    // a refund that fails (over-refund) queues nothing
+    const n = await call((s) => count(s, "select count(*) as n from outbox_events where tenant_id = $1 and type = 'payment.refunded'", [fx.tenantId]));
+    await rejectsWith(() => refund(o.id, 999999), "CONFLICT", "REFUND_EXCEEDS_PAID");
+    assert.equal(await call((s) => count(s, "select count(*) as n from outbox_events where tenant_id = $1 and type = 'payment.refunded'", [fx.tenantId])), n);
+  });
+
   it("overpayment is rejected and nothing is written", async () => {
     const o = await placed();
     const e = await rejectsWith(() => pay(o.id, TOTAL + 1), "CONFLICT", "OVERPAYMENT");
@@ -292,6 +308,7 @@ describe("idempotent ledger writes", () => {
     const a = await refund(o.id, 1000, c);
     const b = await refund(o.id, 1000, c);
     assert.equal(a.payment.id, b.payment.id);
+    assert.equal(await call((s) => count(s, "select count(*) as n from outbox_events where tenant_id = $1 and type = 'payment.refunded' and aggregate_id = $2", [fx.tenantId, a.payment.id])), 1);
     assert.equal((await view(o.id)).payment.refundedPaise, 1000);
   });
 });

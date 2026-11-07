@@ -9,7 +9,7 @@ import {
   type DomainEventInput,
   type EngineContext,
   type SqlClient,
-  type WebhookEvent,
+  type WebhookEvent as WebhookEventType,
 } from "@qenbel/shared";
 import type { z } from "zod";
 
@@ -56,11 +56,12 @@ export function money<T>(fn: () => T): T {
 /** Convert the few Postgres errors an engine can legitimately hit into AppErrors; everything else propagates. */
 export function mapPgError(err: unknown): never {
   if (isAppError(err)) throw err;
-  const e = err as { code?: string; constraint?: string };
+  const e = err as { code?: string };
   if (e && typeof e === "object") {
-    if (e.code === "23505") throw orderError(ErrorCode.CONFLICT, "DUPLICATE", "This record already exists.", { constraint: e.constraint });
-    if (e.code === "23514") throw orderError(ErrorCode.VALIDATION_FAILED, "CHECK_VIOLATION", undefined, { constraint: e.constraint });
-    if (e.code === "23503") throw orderError(ErrorCode.NOT_FOUND, "REFERENCE_NOT_FOUND", undefined, { constraint: e.constraint });
+    // Constraint names stay out of the details: they describe the schema to the caller.
+    if (e.code === "23505") throw orderError(ErrorCode.CONFLICT, "DUPLICATE", "This record already exists.");
+    if (e.code === "23514") throw orderError(ErrorCode.VALIDATION_FAILED, "CHECK_VIOLATION");
+    if (e.code === "23503") throw orderError(ErrorCode.NOT_FOUND, "REFERENCE_NOT_FOUND");
   }
   throw err;
 }
@@ -87,8 +88,15 @@ export async function emitEvent(
   sql: SqlClient,
   ctx: EngineContext,
   type: Extract<
-    WebhookEvent,
-    "order.created" | "order.accepted" | "order.fulfilled" | "order.cancelled" | "payment.completed" | "customer.created"
+    WebhookEventType,
+    | "order.created"
+    | "order.accepted"
+    | "order.fulfilled"
+    | "order.cancelled"
+    | "order.rejected"
+    | "payment.completed"
+    | "payment.refunded"
+    | "customer.created"
   >,
   event: Omit<DomainEventInput, "type">,
 ): Promise<string> {
@@ -121,6 +129,16 @@ export function hashInput(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
 
+/**
+ * A short digest of WHO is calling (actor kind and id, channel, verified customer and conversation). It is folded into
+ * the idempotency route, so another credential or customer that repeats the same key gets a plain miss: it can neither
+ * replay the first caller's result nor learn (through IDEMPOTENCY_CONFLICT) that the key exists.
+ */
+export function principalTag(ctx: EngineContext): string {
+  const parts = [ctx.actor.kind, ctx.actor.id, ctx.actor.channel, ctx.subject?.customerId ?? "", ctx.subject?.conversationId ?? ""];
+  return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 16);
+}
+
 export function requireIdempotencyKey(ctx: EngineContext): string | undefined {
   if (ctx.idempotencyKey === undefined) return undefined;
   return parseOrThrow(idempotencyKeySchema, ctx.idempotencyKey);
@@ -136,7 +154,7 @@ export function requireIdempotencyKey(ctx: EngineContext): string | undefined {
 export async function withIdempotency<T>(
   sql: SqlClient,
   ctx: EngineContext,
-  route: string,
+  routeName: string,
   input: unknown,
   run: () => Promise<string>,
   load: (entityId: string) => Promise<T>,
@@ -144,6 +162,7 @@ export async function withIdempotency<T>(
   const key = requireIdempotencyKey(ctx);
   if (key === undefined) return load(await run());
   const requestHash = hashInput(input);
+  const route = `${routeName}:${principalTag(ctx)}`;
 
   // An expired key (older than 24 h, not yet purged) no longer counts.
   await sql.query("delete from idempotency_keys where tenant_id = $1 and key = $2 and route = $3 and expires_at < now()", [

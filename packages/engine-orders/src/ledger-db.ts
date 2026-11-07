@@ -4,6 +4,7 @@ import { toPaise } from "@qenbel/db";
 import {
   PaymentEntryStatus,
   PaymentKind,
+  WebhookEvent,
   type EngineContext,
   type Paise,
   type PaymentMethod,
@@ -68,7 +69,7 @@ export interface NewEntry {
 
 /**
  * Insert one COMPLETED ledger entry for an order (caller holds the order row lock), queue `payment.completed`
- * (payload.kind says payment or refund) and return the entry. Does not touch the order row.
+ * (kind payment) or `payment.refunded` (kind refund; payload.kind repeats which) and return the entry. Does not touch the order row.
  */
 export async function insertLedgerEntry(sql: SqlClient, ctx: EngineContext, order: OrderRow, entry: NewEntry): Promise<PaymentRow> {
   const id = ctx.newId();
@@ -94,7 +95,7 @@ export async function insertLedgerEntry(sql: SqlClient, ctx: EngineContext, orde
     ],
   );
   const row = res.rows[0] as PaymentRow;
-  await emitEvent(sql, ctx, "payment.completed", {
+  await emitEvent(sql, ctx, entry.kind === PaymentKind.REFUND ? WebhookEvent.PAYMENT_REFUNDED : WebhookEvent.PAYMENT_COMPLETED, {
     aggregateType: "payment",
     aggregateId: id,
     payload: {

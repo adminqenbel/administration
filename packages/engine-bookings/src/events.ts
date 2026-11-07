@@ -22,6 +22,7 @@ export const OUTBOX_BY_ACTION: Partial<Record<BookingAuditAction, WebhookEvent>>
   [BookingAuditAction.CANCEL]: WebhookEvent.BOOKING_CANCELLED,
   [BookingAuditAction.NO_SHOW]: WebhookEvent.BOOKING_NO_SHOW,
   [BookingAuditAction.COMPLETE]: WebhookEvent.BOOKING_COMPLETED,
+  [BookingAuditAction.EXPIRE]: WebhookEvent.BOOKING_EXPIRED,
 };
 
 /** Who did it, from which channel, and what changed. Never put secrets or free text from customers in `details`. */

@@ -53,9 +53,31 @@ A discount reduces the taxable value (GST practice). Discounts above `DISCOUNT_A
 need `capOverride: true`, which the API must set only for a principal with the override permission and never from a
 customer or an AI tool call. The flag, the amount, the reason and the rounding mode go to `audit_log`.
 
-The orders table stores only `discount_paise`, not how it was made, and `order_items` has no tax-rate column. So:
-any line change on a draft clears the discount (result `notices: ["DISCOUNT_CLEARED"]`), and draft edits re-read tax rates
-from the catalogue. `placeOrder` does not recompute: it freezes what the draft holds.
+### Discount persistence
+
+`orders.discount_paise` is the amount taken off. HOW it was made is stored beside it: `discount_type` (`fixed` or
+`percent_bps`, the `DiscountType` constants of `@qenbel/shared`), `discount_value` (paise, or basis points up to
+10000), `discount_reason` and `discount_cap_override`. The input still says `kind: "fixed" | "percent"`; the engine maps
+it. `OrderView.discount` returns `{ type, value, reason, capOverride }` (null when none).
+
+- Every line change on a draft (`addItem`, `updateItem`, `removeItem`) RECOMPUTES `discount_paise` from the stored spec on
+  the new subtotal (percent follows the subtotal; a fixed amount stays). Line and order tax are recomputed with it.
+- The discount is removed (spec columns set to NULL, `notices: ["DISCOUNT_CLEARED"]`, audit `discountCleared: true`) only when
+  the spec became invalid for the edited lines: a fixed amount larger than the new subtotal, or a discount that is now above
+  `DISCOUNT_APPROVAL_CAP_BPS` (a fixed amount on a shrunken order) and was not approved with the override.
+- `discount_cap_override` is true only when the override flag was actually needed when the discount was applied. An approved
+  discount keeps covering its spec through later edits (it is still limited by the subtotal).
+- A percent discount on an emptied draft stays on record with amount 0 and returns when a line is added. `removeDiscount`
+  clears the spec.
+- `placeOrder` does not recompute: it freezes what the draft holds.
+
+### Tax rate per line
+
+`order_items.tax_rate_bps` is copied from the catalogue when the line is inserted and frozen. Draft edits (quantity, note,
+other lines, discount changes) never read the catalogue rate again, so a rate change in the catalogue cannot move an existing
+line. The only way to pick up a new rate (or price) is to remove the line and add the item again. `addItem` merges into an
+existing line only when item, variant, note, unit price AND frozen tax rate match; otherwise it starts a new line. There is no
+"re-price line" function yet.
 
 ## Functions
 
@@ -115,11 +137,13 @@ and paise only; no names, phones or notes.
 | `order.created` | DRAFT to PLACED (drafts are scratch space and are not announced) |
 | `order.accepted` | PLACED to ACCEPTED |
 | `order.fulfilled` | READY to FULFILLED |
-| `order.cancelled` | CANCELLED or REJECTED from a non-draft status (`payload.status` says which) |
-| `payment.completed` | every ledger entry; `payload.kind` is `payment` or `refund` |
+| `order.cancelled` | CANCELLED from a non-draft status (cancelling a draft sends nothing) |
+| `order.rejected` | PLACED to REJECTED (staff declined) |
+| `payment.completed` | every ledger entry of kind `payment` |
+| `payment.refunded` | every ledger entry of kind `refund`: `recordRefund`, and the automatic refund when a paid order is cancelled or rejected |
 | `customer.created` | inline customer created at placement |
 
-PROCESSING, READY and REFUNDED send no order event. Every mutation also writes an `audit_log` row (`order.*`).
+Payloads carry `kind` (`payment` or `refund`) on the two payment events, and `status` / `previousStatus` on order events. PROCESSING, READY and REFUNDED send no order event. Every mutation also writes an `audit_log` row (`order.*`).
 
 ## AI and WhatsApp view
 
@@ -133,7 +157,11 @@ not exist, or only matches a prefix of the reference all give the identical `NOT
 - 100 lines per order, 999 per line (identical item/variant/note/price lines merge), order total at most
   `MAX_ORDER_TOTAL_PAISE`, ledger entry at most `MAX_ENTRY_PAISE`.
 - One currency per order (taken from the first item).
-- Table for dine-in is stored in `fulfilments.address` (`tableLabel`, `resourceId`): `orders` has no resource column.
+- The dine-in table is `orders.resource_id` (composite FK to `resources`, so another tenant's table is refused by the engine as
+  `RESOURCE_NOT_FOUND` and by the database as 23503). It must be an active `table` resource. The fulfilment row keeps only the
+  human label (`address.tableLabel`, defaulting to the resource name); a label-only dine-in or any other fulfilment type sets
+  `resource_id` to NULL.
 - Lists page by `(created_at desc, id desc)` with an opaque cursor; the board returns true counts per status.
 
-See `docs/CONTRACT-REQUESTS.md` for the schema and contract changes this package would like.
+Schema: migrations 012 (events) and 015 (order discount spec, `resource_id`, `tax_rate_bps`) are required. See
+`docs/CONTRACT-REQUESTS.md` for open contract questions.

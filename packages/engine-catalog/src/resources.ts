@@ -1,22 +1,20 @@
-// Resources (staff, room, table, equipment, doctor, vehicle): CRUD with archive, weekly schedules, time off,
+// Resources (staff, room, table, equipment, doctor, vehicle): CRUD with archive, weekly schedules, weekly breaks, time off,
 // and which services each resource can serve.
 //
-// INTERIM STORAGE: migration 005 has no table for time off, daily breaks or resource-to-service links.
-// Until the coordinator adds them (see docs/CONTRACT-REQUESTS.md), these three live in the `attributes` jsonb of the
-// resource row under reserved keys: `timeOff`, `breaks`, `serviceIds`. All access goes through this file, so moving to
-// real tables later is a change here only. Writes lock the resource row (`for update`), so they cannot interleave.
+// Storage (migration 013): `resource_time_off` (half-open [starts_at, ends_at)), `resource_breaks` (one row per weekday,
+// 0 = Sunday), `resource_services` (no rows = any service whose required resource type matches). `resources.attributes`
+// is a plain bag of scalar keys; nothing in it has meaning to the engine. Writes lock the resource row (`for update`), so
+// they cannot interleave.
 import { z } from "zod";
 import {
   AllocationMode, AppError, ErrorCode, ResourceType, WEEKDAYS, hmToMinutes, instantSchema, localDateOf, localToUtcMs, timeIntervalSchema,
   weekdayOf, weeklyHoursSchema, type TimeInterval, type Weekday, type WeeklyHours,
 } from "@qenbel/shared";
 import {
-  SetBuilder, assertRef, count, cursorSchema, decodeCursor, idArg, iso, isoReq, likeEscape, limitSchema, notFound, op, text, toPage,
+  SetBuilder, assertRef, count, cursorSchema, decodeCursor, hm, idArg, iso, isoReq, likeEscape, limitSchema, notFound, staffOp, text, toPage,
   type EngineContext, type SqlClient,
 } from "./common.ts";
 import { weekFromRows } from "./business.ts";
-
-export const RESERVED_RESOURCE_KEYS = ["timeOff", "breaks", "serviceIds"] as const;
 
 const typeInput = z.enum(Object.values(ResourceType) as [string, ...string[]]);
 const modeInput = z.enum(Object.values(AllocationMode) as [string, ...string[]]);
@@ -24,14 +22,15 @@ const archivedFilter = z.enum(["exclude", "include", "only"]).default("exclude")
 
 const attrsInput = z
   .record(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,39}$/), z.union([text(0, 500), z.number().finite(), z.boolean()]))
-  .refine((r) => Object.keys(r).length <= 20, "At most 20 attributes")
-  .refine((r) => !Object.keys(r).some((k) => (RESERVED_RESOURCE_KEYS as readonly string[]).includes(k)), "timeOff, breaks and serviceIds are managed by their own functions");
+  .refine((r) => Object.keys(r).length <= 20, "At most 20 attributes");
 
 export interface TimeOffDto {
   id: string;
   startsAt: string;
   endsAt: string;
   reason: string | null;
+  /** The staff user who recorded it, when the actor was a user of this tenant. */
+  createdByUserId: string | null;
 }
 
 export interface ResourceDto {
@@ -43,8 +42,9 @@ export interface ResourceDto {
   allocationMode: string;
   capacityUnits: number;
   minUnits: number;
+  /** Plain scalar key/value bag. No key has a special meaning (time off, breaks and services have their own tables). */
   attributes: Record<string, unknown>;
-  /** Explicit service links. Empty means "any service whose required resource type matches". */
+  /** Explicit service links (resource_services). Empty means "any service whose required resource type matches". */
   serviceIds: string[];
   active: boolean;
   archivedAt: string | null;
@@ -72,40 +72,7 @@ interface ResourceRow {
 const RESOURCE_COLS = `r.id, r.location_id, r.user_id, r.type, r.name, r.allocation_mode, r.capacity_units, r.min_units, r.attributes,
   r.active, r.archived_at, r.created_at, r.updated_at, lower(r.name) as name_key`;
 
-// ---- interim extras ----------------------------------------------------------------------------------
-
-export interface ResourceExtras {
-  timeOff: Array<{ id: string; startsAt: string; endsAt: string; reason: string | null }>;
-  breaks: TimeInterval[];
-  serviceIds: string[];
-}
-
-const extrasSchema = z.object({
-  timeOff: z.array(z.object({ id: z.string(), startsAt: z.string(), endsAt: z.string(), reason: z.string().nullable().optional() })).catch([]),
-  breaks: z.array(timeIntervalSchema).catch([]),
-  serviceIds: z.array(z.string()).catch([]),
-});
-
-export function readExtras(attributes: Record<string, unknown> | null): ResourceExtras {
-  const parsed = extrasSchema.parse({
-    timeOff: attributes?.timeOff ?? [],
-    breaks: attributes?.breaks ?? [],
-    serviceIds: attributes?.serviceIds ?? [],
-  });
-  return {
-    timeOff: parsed.timeOff.map((t) => ({ id: t.id, startsAt: t.startsAt, endsAt: t.endsAt, reason: t.reason ?? null })),
-    breaks: parsed.breaks,
-    serviceIds: parsed.serviceIds,
-  };
-}
-
-function userAttributes(attributes: Record<string, unknown> | null): Record<string, unknown> {
-  const out = { ...(attributes ?? {}) };
-  for (const k of RESERVED_RESOURCE_KEYS) delete out[k];
-  return out;
-}
-
-function toResource(r: ResourceRow): ResourceDto {
+function toResource(r: ResourceRow, serviceIds: string[]): ResourceDto {
   return {
     id: r.id,
     locationId: r.location_id,
@@ -115,8 +82,8 @@ function toResource(r: ResourceRow): ResourceDto {
     allocationMode: r.allocation_mode,
     capacityUnits: r.capacity_units,
     minUnits: r.min_units,
-    attributes: userAttributes(r.attributes),
-    serviceIds: readExtras(r.attributes).serviceIds,
+    attributes: { ...(r.attributes ?? {}) },
+    serviceIds,
     active: r.active,
     archivedAt: iso(r.archived_at),
     createdAt: isoReq(r.created_at),
@@ -124,11 +91,33 @@ function toResource(r: ResourceRow): ResourceDto {
   };
 }
 
+/** Service links for many resources in one query (no per-row round trips). Ordered by item id. */
+async function serviceIdsFor(sql: SqlClient, ctx: EngineContext, resourceIds: readonly string[]): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (resourceIds.length === 0) return out;
+  const res = await sql.query<{ resource_id: string; catalogue_item_id: string }>(
+    `select resource_id, catalogue_item_id from resource_services
+      where tenant_id = $1 and resource_id = any($2::uuid[]) order by catalogue_item_id`,
+    [ctx.tenantId, [...resourceIds]],
+  );
+  for (const r of res.rows) {
+    const list = out.get(r.resource_id) ?? [];
+    list.push(r.catalogue_item_id);
+    out.set(r.resource_id, list);
+  }
+  return out;
+}
+
+async function toResources(sql: SqlClient, ctx: EngineContext, rows: readonly ResourceRow[]): Promise<ResourceDto[]> {
+  const links = await serviceIdsFor(sql, ctx, rows.map((r) => r.id));
+  return rows.map((r) => toResource(r, links.get(r.id) ?? []));
+}
+
 async function loadResource(sql: SqlClient, ctx: EngineContext, id: string): Promise<ResourceDto> {
   const res = await sql.query<ResourceRow>(`select ${RESOURCE_COLS} from resources r where r.tenant_id = $1 and r.id = $2`, [ctx.tenantId, id]);
   const row = res.rows[0];
   if (!row) throw notFound("Resource");
-  return toResource(row);
+  return (await toResources(sql, ctx, [row]))[0] as ResourceDto;
 }
 
 /** Lock the resource row and return it. */
@@ -137,10 +126,6 @@ async function lockResource(sql: SqlClient, ctx: EngineContext, id: string): Pro
   const row = res.rows[0];
   if (!row) throw notFound("Resource");
   return row;
-}
-
-async function writeAttributes(sql: SqlClient, ctx: EngineContext, id: string, attrs: Record<string, unknown>): Promise<void> {
-  await sql.query("update resources set attributes = $3::jsonb where tenant_id = $1 and id = $2", [ctx.tenantId, id, JSON.stringify(attrs)]);
 }
 
 // ---- CRUD --------------------------------------------------------------------------------------------
@@ -160,7 +145,7 @@ const createResourceInput = z
   .strict()
   .refine((v) => v.minUnits <= v.capacityUnits, "minUnits cannot exceed capacityUnits");
 
-export const createResource = op(createResourceInput, async (sql, ctx, input): Promise<ResourceDto> => {
+export const createResource = staffOp(createResourceInput, async (sql, ctx, input): Promise<ResourceDto> => {
   if (input.locationId) await assertRef(sql, ctx, "locations", input.locationId, "locationId");
   if (input.userId) await assertRef(sql, ctx, "users", input.userId, "userId");
   const res = await sql.query<{ id: string }>(
@@ -174,9 +159,9 @@ export const createResource = op(createResourceInput, async (sql, ctx, input): P
   return loadResource(sql, ctx, (res.rows[0] as { id: string }).id);
 });
 
-export const getResource = op(z.object({ resourceId: idArg }).strict(), (sql, ctx, input) => loadResource(sql, ctx, input.resourceId));
+export const getResource = staffOp(z.object({ resourceId: idArg }).strict(), (sql, ctx, input) => loadResource(sql, ctx, input.resourceId));
 
-export const updateResource = op(
+export const updateResource = staffOp(
   z
     .object({
       resourceId: idArg,
@@ -209,10 +194,7 @@ export const updateResource = op(
     if (input.minUnits !== undefined) set.set("min_units", input.minUnits);
     if (input.active !== undefined) set.set("active", input.active);
     if (input.attributes !== undefined) {
-      // Replace user attributes, keep the reserved interim keys.
-      const reserved: Record<string, unknown> = {};
-      for (const k of RESERVED_RESOURCE_KEYS) if (row.attributes?.[k] !== undefined) reserved[k] = row.attributes[k];
-      set.set("attributes", JSON.stringify({ ...input.attributes, ...reserved }), "::jsonb");
+      set.set("attributes", JSON.stringify(input.attributes), "::jsonb");
     }
     // The database refuses a mode change or a capacity cut while allocations are active (mapped to CONFLICT).
     await sql.query(`update resources set ${set.clause} where tenant_id = $1 and id = $2`, set.values);
@@ -231,9 +213,9 @@ async function countUpcomingBookings(sql: SqlClient, ctx: EngineContext, resourc
 }
 
 /** Soft delete. Refused while the resource has upcoming bookings or live holds (R6.4); the count is in `details`. */
-export const archiveResource = op(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceDto> => {
+export const archiveResource = staffOp(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceDto> => {
   const row = await lockResource(sql, ctx, input.resourceId);
-  if (row.archived_at) return toResource(row);
+  if (row.archived_at) return loadResource(sql, ctx, input.resourceId);
   const n = await countUpcomingBookings(sql, ctx, input.resourceId, ctx.now());
   if (n > 0) {
     throw new AppError(ErrorCode.CONFLICT, `This resource has ${n} upcoming booking${n === 1 ? "" : "s"}. Move or cancel them first.`, { upcomingBookings: n });
@@ -242,7 +224,7 @@ export const archiveResource = op(z.object({ resourceId: idArg }).strict(), asyn
   return loadResource(sql, ctx, input.resourceId);
 });
 
-export const restoreResource = op(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceDto> => {
+export const restoreResource = staffOp(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceDto> => {
   const res = await sql.query("update resources set archived_at = null where tenant_id = $1 and id = $2 returning id", [ctx.tenantId, input.resourceId]);
   if (res.rows.length === 0) throw notFound("Resource");
   return loadResource(sql, ctx, input.resourceId);
@@ -253,11 +235,11 @@ export const restoreResource = op(z.object({ resourceId: idArg }).strict(), asyn
  * no explicit links serves services whose required resource type is unset or equals the resource type.
  */
 export const ELIGIBLE_SQL = `(
-  coalesce(r.attributes -> 'serviceIds', '[]'::jsonb) @> to_jsonb(i.id::text)
-  or (jsonb_array_length(coalesce(r.attributes -> 'serviceIds', '[]'::jsonb)) = 0
+  exists (select 1 from resource_services rs where rs.tenant_id = r.tenant_id and rs.resource_id = r.id and rs.catalogue_item_id = i.id)
+  or (not exists (select 1 from resource_services rs2 where rs2.tenant_id = r.tenant_id and rs2.resource_id = r.id)
       and (i.required_resource_type is null or i.required_resource_type = r.type)))`;
 
-export const listResources = op(
+export const listResources = staffOp(
   z
     .object({
       type: typeInput.optional(),
@@ -294,7 +276,7 @@ export const listResources = op(
       params,
     );
     const page = toPage(res.rows, input.limit, (r) => [r.name_key as string, r.id]);
-    return { items: page.items.map(toResource), nextCursor: page.nextCursor };
+    return { items: await toResources(sql, ctx, page.items), nextCursor: page.nextCursor };
   },
 );
 
@@ -317,7 +299,7 @@ async function resourceTimezone(sql: SqlClient, ctx: EngineContext, locationId: 
   return t.rows[0]?.default_timezone ?? "Asia/Kolkata";
 }
 
-export const getResourceSchedule = op(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceSchedule> => {
+export const getResourceSchedule = staffOp(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceSchedule> => {
   await assertRef(sql, ctx, "resources", input.resourceId, "resourceId");
   const res = await sql.query<{ weekday: number; s: string; e: string }>(
     `select weekday, start_time::text as s, end_time::text as e from resource_schedules
@@ -357,7 +339,7 @@ async function countOutsideSchedule(sql: SqlClient, ctx: EngineContext, row: Res
  * Replace the resource's open-ended weekly working pattern. An all-empty week removes the schedule, so the
  * resource follows the location's hours again. Refused if upcoming bookings would fall outside the new pattern (R6.5).
  */
-export const setResourceSchedule = op(z.object({ resourceId: idArg, hours: weeklyHoursSchema }).strict(), async (sql, ctx, input): Promise<ResourceSchedule> => {
+export const setResourceSchedule = staffOp(z.object({ resourceId: idArg, hours: weeklyHoursSchema }).strict(), async (sql, ctx, input): Promise<ResourceSchedule> => {
   const row = await lockResource(sql, ctx, input.resourceId);
   if (!isEmptyWeek(input.hours)) {
     const n = await countOutsideSchedule(sql, ctx, row, input.hours);
@@ -377,63 +359,137 @@ export const setResourceSchedule = op(z.object({ resourceId: idArg, hours: weekl
   return getResourceSchedule(sql, ctx, { resourceId: input.resourceId });
 });
 
-// ---- daily breaks (interim) --------------------------------------------------------------------------
+// ---- weekly breaks (resource_breaks) -----------------------------------------------------------------
 
-/** Daily breaks for one resource (for example lunch 13:00-14:00 every working day). Replaces the list. */
-export const setResourceBreaks = op(
-  z
-    .object({
-      resourceId: idArg,
-      breaks: z
-        .array(timeIntervalSchema)
-        .max(10)
-        .refine((list) => {
-          const s = [...list].sort((a, b) => hmToMinutes(a.start) - hmToMinutes(b.start));
-          return s.every((b, i) => i === 0 || hmToMinutes(b.start) >= hmToMinutes((s[i - 1] as TimeInterval).end));
-        }, "Breaks must not overlap"),
-    })
-    .strict(),
-  async (sql, ctx, input): Promise<{ resourceId: string; breaks: TimeInterval[] }> => {
-    const row = await lockResource(sql, ctx, input.resourceId);
-    const attrs = { ...(row.attributes ?? {}) };
-    if (input.breaks.length === 0) delete attrs.breaks;
-    else attrs.breaks = input.breaks;
-    await writeAttributes(sql, ctx, input.resourceId, attrs);
-    return { resourceId: input.resourceId, breaks: input.breaks };
-  },
-);
-
-export const getResourceBreaks = op(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input) => {
-  const r = await loadRaw(sql, ctx, input.resourceId);
-  return { resourceId: input.resourceId, breaks: readExtras(r.attributes).breaks };
-});
-
-async function loadRaw(sql: SqlClient, ctx: EngineContext, id: string): Promise<ResourceRow> {
-  const res = await sql.query<ResourceRow>(`select ${RESOURCE_COLS} from resources r where r.tenant_id = $1 and r.id = $2`, [ctx.tenantId, id]);
-  const row = res.rows[0];
-  if (!row) throw notFound("Resource");
-  return row;
+export interface ResourceBreaks {
+  resourceId: string;
+  /** Breaks that apply on every weekday (what a "daily break" is). */
+  breaks: TimeInterval[];
+  /** The full pattern per weekday. Equals `breaks` on each day unless weekday-specific rows exist. */
+  weekly: WeeklyHours;
+  /** True when the resource has any rows; otherwise the tenant/pack default breaks apply (engine-bookings). */
+  hasBreaks: boolean;
 }
 
-// ---- time off (interim) ------------------------------------------------------------------------------
+const sortedIntervals = (list: readonly TimeInterval[]): TimeInterval[] => [...list].sort((a, b) => hmToMinutes(a.start) - hmToMinutes(b.start));
+const noOverlap = (list: readonly TimeInterval[]): boolean => {
+  const s = sortedIntervals(list);
+  return s.every((b, i) => i === 0 || hmToMinutes(b.start) >= hmToMinutes((s[i - 1] as TimeInterval).end));
+};
+const emptyDays = (): WeeklyHours => ({ sun: [], mon: [], tue: [], wed: [], thu: [], fri: [], sat: [] });
+
+/** Break rows of resources (set-based), as weekly patterns. A resource without rows is absent from the map. */
+export async function loadWeeklyBreaks(sql: SqlClient, ctx: EngineContext, resourceIds: readonly string[]): Promise<Map<string, WeeklyHours>> {
+  const out = new Map<string, WeeklyHours>();
+  if (resourceIds.length === 0) return out;
+  const res = await sql.query<{ resource_id: string; weekday: number; s: string; e: string }>(
+    `select resource_id, weekday, start_time::text as s, end_time::text as e from resource_breaks
+      where tenant_id = $1 and resource_id = any($2::uuid[]) order by resource_id, weekday, start_time`,
+    [ctx.tenantId, [...resourceIds]],
+  );
+  for (const r of res.rows) {
+    const week = out.get(r.resource_id) ?? emptyDays();
+    week[WEEKDAYS[r.weekday] as Weekday].push({ start: hm(r.s), end: hm(r.e) });
+    out.set(r.resource_id, week);
+  }
+  return out;
+}
+
+function commonBreaks(week: WeeklyHours): TimeInterval[] {
+  const key = (iv: TimeInterval): string => `${iv.start}-${iv.end}`;
+  return week.mon.filter((iv) => WEEKDAYS.every((d) => week[d].some((x) => key(x) === key(iv)))).map((iv) => ({ ...iv }));
+}
+
+const breaksInput = z
+  .object({
+    resourceId: idArg,
+    /** Daily break(s): the same on all seven weekdays (seven rows per break). */
+    breaks: z.array(timeIntervalSchema).max(10).refine(noOverlap, "Breaks must not overlap").optional(),
+    /** Or a break pattern per weekday. Exactly one of `breaks` and `weekly`. */
+    weekly: weeklyHoursSchema.optional(),
+  })
+  .strict()
+  .refine((v) => (v.breaks === undefined) !== (v.weekly === undefined), "Give either breaks (every day) or weekly (per weekday)");
+
+/**
+ * Replace the resource's breaks. `breaks` is the daily form (lunch 13:00-14:00 every day, written as seven rows);
+ * `weekly` sets a pattern per weekday. An empty list / all-empty week removes them, so the tenant default breaks apply.
+ */
+export const setResourceBreaks = staffOp(breaksInput, async (sql, ctx, input): Promise<ResourceBreaks> => {
+  await lockResource(sql, ctx, input.resourceId);
+  const daily = input.breaks ?? [];
+  const week: WeeklyHours = input.weekly ?? { sun: daily, mon: daily, tue: daily, wed: daily, thu: daily, fri: daily, sat: daily };
+  const days: number[] = [];
+  const starts: string[] = [];
+  const ends: string[] = [];
+  WEEKDAYS.forEach((d, dow) => {
+    for (const iv of week[d]) {
+      days.push(dow);
+      starts.push(iv.start);
+      ends.push(iv.end);
+    }
+  });
+  if (WEEKDAYS.some((d) => week[d].length > 10)) throw new AppError(ErrorCode.VALIDATION_FAILED, "At most 10 breaks per weekday.");
+  await sql.query("delete from resource_breaks where tenant_id = $1 and resource_id = $2", [ctx.tenantId, input.resourceId]);
+  if (days.length > 0) {
+    await sql.query(
+      `insert into resource_breaks (tenant_id, resource_id, weekday, start_time, end_time)
+       select $1, $2, d, s::time, e::time from unnest($3::smallint[], $4::text[], $5::text[]) as t(d, s, e)`,
+      [ctx.tenantId, input.resourceId, days, starts, ends],
+    );
+  }
+  return readBreaks(sql, ctx, input.resourceId);
+});
+
+async function readBreaks(sql: SqlClient, ctx: EngineContext, resourceId: string): Promise<ResourceBreaks> {
+  const found = (await loadWeeklyBreaks(sql, ctx, [resourceId])).get(resourceId);
+  const weekly = found ?? emptyDays();
+  return { resourceId, breaks: found ? commonBreaks(weekly) : [], weekly, hasBreaks: found !== undefined };
+}
+
+export const getResourceBreaks = staffOp(z.object({ resourceId: idArg }).strict(), async (sql, ctx, input): Promise<ResourceBreaks> => {
+  await assertRef(sql, ctx, "resources", input.resourceId, "resourceId");
+  return readBreaks(sql, ctx, input.resourceId);
+});
+
+// ---- time off (resource_time_off) --------------------------------------------------------------------
 
 const MAX_TIME_OFF = 500;
+
+interface TimeOffRow {
+  id: string;
+  starts_at: Date;
+  ends_at: Date;
+  reason: string | null;
+  created_by_user_id: string | null;
+}
+
+const toTimeOff = (r: TimeOffRow): TimeOffDto => ({
+  id: r.id,
+  startsAt: isoReq(r.starts_at),
+  endsAt: isoReq(r.ends_at),
+  reason: r.reason,
+  createdByUserId: r.created_by_user_id,
+});
 
 /**
  * Add time off (single or ranged). Refused if live bookings or holds overlap it, with the count (R6.5).
  * Times are instants; for a whole local day use that day's start and the next day's start in the location's zone.
+ * The interval is half-open: time off ending exactly when a booking starts does not touch it.
  */
-export const addResourceTimeOff = op(
+export const addResourceTimeOff = staffOp(
   z
-    .object({ resourceId: idArg, startsAt: instantSchema, endsAt: instantSchema, reason: text(1, 200).optional() })
+    .object({ resourceId: idArg, startsAt: instantSchema, endsAt: instantSchema, reason: text(1, 500).optional() })
     .strict()
     .refine((v) => Date.parse(v.endsAt) > Date.parse(v.startsAt), "endsAt must be after startsAt")
     .refine((v) => Date.parse(v.endsAt) - Date.parse(v.startsAt) <= 366 * 86_400_000, "Time off is at most 366 days"),
   async (sql, ctx, input): Promise<TimeOffDto> => {
     const row = await lockResource(sql, ctx, input.resourceId);
     if (row.archived_at) throw new AppError(ErrorCode.CONFLICT, "Restore this resource before changing it.");
-    const extras = readExtras(row.attributes);
-    if (extras.timeOff.length >= MAX_TIME_OFF) throw new AppError(ErrorCode.CONFLICT, `A resource can have at most ${MAX_TIME_OFF} time off entries. Remove old ones first.`);
+    const existing = await sql.query<{ n: string }>("select count(*) as n from resource_time_off where tenant_id = $1 and resource_id = $2", [ctx.tenantId, input.resourceId]);
+    if (count((existing.rows[0] as { n: string }).n) >= MAX_TIME_OFF) {
+      throw new AppError(ErrorCode.CONFLICT, `A resource can have at most ${MAX_TIME_OFF} time off entries. Remove old ones first.`);
+    }
     const start = new Date(input.startsAt);
     const end = new Date(input.endsAt);
     const hit = await sql.query<{ n: string }>(
@@ -445,48 +501,50 @@ export const addResourceTimeOff = op(
     if (n > 0) {
       throw new AppError(ErrorCode.CONFLICT, `${n} booking${n === 1 ? "" : "s"} fall in this time. Move or cancel them first.`, { affectedBookings: n });
     }
-    const entry = { id: ctx.newId(), startsAt: start.toISOString(), endsAt: end.toISOString(), reason: input.reason ?? null };
-    const timeOff = [...extras.timeOff, entry].sort((a, b) => a.startsAt.localeCompare(b.startsAt));
-    await writeAttributes(sql, ctx, input.resourceId, { ...(row.attributes ?? {}), timeOff });
-    return entry;
+    // created_by_user_id: only a real user of this tenant is recorded (never an api key id or a free-form actor id).
+    const ins = await sql.query<TimeOffRow>(
+      `insert into resource_time_off (tenant_id, resource_id, starts_at, ends_at, reason, created_by_user_id)
+       values ($1, $2, $3, $4, $5, (select id from users where tenant_id = $1 and id::text = $6 and $7::text = 'user'))
+       returning id, starts_at, ends_at, reason, created_by_user_id`,
+      [ctx.tenantId, input.resourceId, start, end, input.reason ?? null, ctx.actor.id, ctx.actor.kind],
+    );
+    return toTimeOff(ins.rows[0] as TimeOffRow);
   },
 );
 
-export const removeResourceTimeOff = op(z.object({ resourceId: idArg, timeOffId: z.string().min(1).max(64) }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
-  const row = await lockResource(sql, ctx, input.resourceId);
-  const extras = readExtras(row.attributes);
-  if (!extras.timeOff.some((t) => t.id === input.timeOffId)) throw notFound("Time off");
-  const attrs = { ...(row.attributes ?? {}) };
-  const rest = extras.timeOff.filter((t) => t.id !== input.timeOffId);
-  if (rest.length === 0) delete attrs.timeOff;
-  else attrs.timeOff = rest;
-  await writeAttributes(sql, ctx, input.resourceId, attrs);
+export const removeResourceTimeOff = staffOp(z.object({ resourceId: idArg, timeOffId: idArg }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
+  await lockResource(sql, ctx, input.resourceId);
+  const res = await sql.query("delete from resource_time_off where tenant_id = $1 and resource_id = $2 and id = $3 returning id", [ctx.tenantId, input.resourceId, input.timeOffId]);
+  if (res.rows.length === 0) throw notFound("Time off");
   return { deleted: true };
 });
 
-/** Time off overlapping [from, to) when given, else all entries. Ordered by start. */
-export const listResourceTimeOff = op(
+/** Time off overlapping [from, to) when given (`starts_at < to and ends_at > from`), else all entries. Ordered by start. */
+export const listResourceTimeOff = staffOp(
   z.object({ resourceId: idArg, from: instantSchema.optional(), to: instantSchema.optional() }).strict(),
   async (sql, ctx, input): Promise<TimeOffDto[]> => {
-    const row = await loadRaw(sql, ctx, input.resourceId);
-    const from = input.from ? Date.parse(input.from) : -Infinity;
-    const to = input.to ? Date.parse(input.to) : Infinity;
-    return readExtras(row.attributes)
-      .timeOff.filter((t) => Date.parse(t.startsAt) < to && Date.parse(t.endsAt) > from)
-      .sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+    await assertRef(sql, ctx, "resources", input.resourceId, "resourceId");
+    const res = await sql.query<TimeOffRow>(
+      `select id, starts_at, ends_at, reason, created_by_user_id from resource_time_off
+        where tenant_id = $1 and resource_id = $2
+          and ($3::timestamptz is null or ends_at > $3) and ($4::timestamptz is null or starts_at < $4)
+        order by starts_at, id`,
+      [ctx.tenantId, input.resourceId, input.from ? new Date(input.from) : null, input.to ? new Date(input.to) : null],
+    );
+    return res.rows.map(toTimeOff);
   },
 );
 
-// ---- resource to service eligibility (interim) -------------------------------------------------------
+// ---- resource to service eligibility (resource_services) ---------------------------------------------
 
 /**
  * Limit a resource to specific services (a haircut by stylists only). Replaces the list; an empty list removes the
  * limit, and the resource then serves services whose required resource type matches its type.
  */
-export const setResourceServices = op(
+export const setResourceServices = staffOp(
   z.object({ resourceId: idArg, serviceIds: z.array(idArg).max(200) }).strict(),
   async (sql, ctx, input): Promise<ResourceDto> => {
-    const row = await lockResource(sql, ctx, input.resourceId);
+    await lockResource(sql, ctx, input.resourceId);
     const ids = [...new Set(input.serviceIds.map((s) => s.toLowerCase()))];
     if (ids.length > 0) {
       const found = await sql.query<{ n: string }>(
@@ -497,16 +555,19 @@ export const setResourceServices = op(
         throw new AppError(ErrorCode.NOT_FOUND, "One or more services were not found.", { field: "serviceIds" });
       }
     }
-    const attrs = { ...(row.attributes ?? {}) };
-    if (ids.length === 0) delete attrs.serviceIds;
-    else attrs.serviceIds = ids;
-    await writeAttributes(sql, ctx, input.resourceId, attrs);
+    await sql.query("delete from resource_services where tenant_id = $1 and resource_id = $2", [ctx.tenantId, input.resourceId]);
+    if (ids.length > 0) {
+      await sql.query(
+        "insert into resource_services (tenant_id, resource_id, catalogue_item_id) select $1, $2, unnest($3::uuid[])",
+        [ctx.tenantId, input.resourceId, ids],
+      );
+    }
     return loadResource(sql, ctx, input.resourceId);
   },
 );
 
 /** Active, unarchived resources that can serve a service, optionally at one location (resources without a location match every location). */
-export const listResourcesForService = op(
+export const listResourcesForService = staffOp(
   z.object({ serviceId: idArg, locationId: idArg.optional() }).strict(),
   async (sql, ctx, input): Promise<ResourceDto[]> => {
     await assertRef(sql, ctx, "catalogue_items", input.serviceId, "serviceId");
@@ -517,6 +578,6 @@ export const listResourcesForService = op(
         order by lower(r.name), r.id limit 500`,
       [ctx.tenantId, input.serviceId, input.locationId ?? null],
     );
-    return res.rows.map(toResource);
+    return toResources(sql, ctx, res.rows);
   },
 );

@@ -19,6 +19,7 @@ export { slotsForResource, effectiveIntervals, peakUnits } from "./availability-
 export type {
   AllocationRow,
   AvailabilityDataSource,
+  BreakRow,
   CandidateQuery,
   HolidayRow,
   HourRow,

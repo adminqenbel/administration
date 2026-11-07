@@ -6,7 +6,7 @@ import {
   type TimeInterval, type Weekday, type WeeklyHours,
 } from "@qenbel/shared";
 import {
-  SetBuilder, assertRef, count, cursorSchema, decodeCursor, hm, idArg, isoReq, limitSchema, notFound, op, op0, text, toPage,
+  SetBuilder, assertRef, count, cursorSchema, decodeCursor, hm, idArg, isoReq, limitSchema, notFound, op, op0, staffOp, staffOp0, text, toPage,
   type EngineContext, type SqlClient,
 } from "./common.ts";
 import { emailInput, phoneInput } from "./customers.ts";
@@ -115,7 +115,7 @@ async function tenantTimezone(sql: SqlClient, ctx: EngineContext): Promise<strin
   return res.rows[0]?.default_timezone ?? "Asia/Kolkata";
 }
 
-export const createLocation = op(
+export const createLocation = staffOp(
   z
     .object({
       name: text(1, 200),
@@ -141,7 +141,7 @@ export const createLocation = op(
   },
 );
 
-export const updateLocation = op(
+export const updateLocation = staffOp(
   z
     .object({
       locationId: idArg,
@@ -173,9 +173,9 @@ export const updateLocation = op(
   },
 );
 
-export const getLocation = op(z.object({ locationId: idArg }).strict(), (sql, ctx, input) => loadLocation(sql, ctx, input.locationId));
+export const getLocation = staffOp(z.object({ locationId: idArg }).strict(), (sql, ctx, input) => loadLocation(sql, ctx, input.locationId));
 
-export const listLocations = op(z.object({ includeArchived: z.boolean().default(false) }).strict(), async (sql, ctx, input): Promise<LocationDto[]> => {
+export const listLocations = staffOp(z.object({ includeArchived: z.boolean().default(false) }).strict(), async (sql, ctx, input): Promise<LocationDto[]> => {
   const res = await sql.query<LocationRow>(
     `select ${LOCATION_COLS} from locations where tenant_id = $1 and ($2::boolean or active) order by is_default desc, lower(name), id limit 200`,
     [ctx.tenantId, input.includeArchived],
@@ -184,7 +184,7 @@ export const listLocations = op(z.object({ includeArchived: z.boolean().default(
 });
 
 /** Soft delete (`active = false`). Refused for the default location, and while live bookings are still to come there. */
-export const archiveLocation = op(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationDto> => {
+export const archiveLocation = staffOp(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationDto> => {
   const cur = await sql.query<LocationRow>(`select ${LOCATION_COLS} from locations where tenant_id = $1 and id = $2 for update`, [ctx.tenantId, input.locationId]);
   const row = cur.rows[0];
   if (!row) throw notFound("Location");
@@ -203,7 +203,7 @@ export const archiveLocation = op(z.object({ locationId: idArg }).strict(), asyn
   return loadLocation(sql, ctx, input.locationId);
 });
 
-export const restoreLocation = op(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationDto> => {
+export const restoreLocation = staffOp(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationDto> => {
   const res = await sql.query("update locations set active = true where tenant_id = $1 and id = $2 returning id", [ctx.tenantId, input.locationId]);
   if (res.rows.length === 0) throw notFound("Location");
   return loadLocation(sql, ctx, input.locationId);
@@ -227,7 +227,7 @@ export async function readLocationHours(sql: SqlClient, ctx: EngineContext, loca
   return weekFromRows(res.rows);
 }
 
-export const getLocationHours = op(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationHours> => {
+export const getLocationHours = staffOp(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationHours> => {
   const loc = await loadLocation(sql, ctx, input.locationId);
   const hours = await readLocationHours(sql, ctx, input.locationId);
   return { locationId: loc.id, timezone: loc.timezone, hours, breaks: breaksOf(hours) };
@@ -237,7 +237,7 @@ export const getLocationHours = op(z.object({ locationId: idArg }).strict(), asy
  * Replace the whole weekly pattern of a location. A day with several intervals has breaks between them
  * (09:00-13:00 and 14:00-18:00 means a break 13:00-14:00). An empty day is closed. "24:00" may end an interval.
  */
-export const setLocationHours = op(z.object({ locationId: idArg, hours: weeklyHoursSchema }).strict(), async (sql, ctx, input): Promise<LocationHours> => {
+export const setLocationHours = staffOp(z.object({ locationId: idArg, hours: weeklyHoursSchema }).strict(), async (sql, ctx, input): Promise<LocationHours> => {
   const loc = await sql.query("select 1 from locations where tenant_id = $1 and id = $2 for update", [ctx.tenantId, input.locationId]);
   if (loc.rows.length === 0) throw notFound("Location");
   await sql.query("delete from business_hours where tenant_id = $1 and location_id = $2", [ctx.tenantId, input.locationId]);
@@ -301,7 +301,7 @@ async function loadHoliday(sql: SqlClient, ctx: EngineContext, id: string): Prom
 }
 
 /** A date a location is closed, or open on special hours. `locationId` omitted or null means every location. */
-export const createHoliday = op(
+export const createHoliday = staffOp(
   z
     .object({
       locationId: idArg.nullable().optional(),
@@ -324,7 +324,7 @@ export const createHoliday = op(
   },
 );
 
-export const updateHoliday = op(
+export const updateHoliday = staffOp(
   z
     .object({
       holidayId: idArg,
@@ -357,14 +357,14 @@ export const updateHoliday = op(
   },
 );
 
-export const deleteHoliday = op(z.object({ holidayId: idArg }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
+export const deleteHoliday = staffOp(z.object({ holidayId: idArg }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
   const res = await sql.query("delete from holidays where tenant_id = $1 and id = $2 returning id", [ctx.tenantId, input.holidayId]);
   if (res.rows.length === 0) throw notFound("Holiday");
   return { deleted: true };
 });
 
 /** With `locationId`: holidays that apply to that location (its own plus the all-location ones). */
-export const listHolidays = op(
+export const listHolidays = staffOp(
   z
     .object({ locationId: idArg.optional(), from: localDateSchema.optional(), to: localDateSchema.optional(), limit: limitSchema, cursor: cursorSchema })
     .strict(),
@@ -472,7 +472,7 @@ async function locationsWithHours(sql: SqlClient, ctx: EngineContext, includeArc
 }
 
 /** Staff view of the business: name, pack, time zone, settings and every location with its hours. */
-export const getBusinessProfile = op0(async (sql, ctx): Promise<BusinessProfile> => {
+export const getBusinessProfile = staffOp0(async (sql, ctx): Promise<BusinessProfile> => {
   const t = await loadTenant(sql, ctx);
   return {
     name: t.name,
@@ -539,7 +539,7 @@ export const getBusinessProfileForChannel = op0(async (sql, ctx): Promise<Channe
 });
 
 /** Edit name, default time zone and the known settings. Other keys already in `settings` are preserved. */
-export const updateBusinessProfile = op(
+export const updateBusinessProfile = staffOp(
   z
     .object({
       name: text(1, 200).optional(),

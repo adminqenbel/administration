@@ -74,7 +74,7 @@ const orderCalls: [string, (s: Client, c: ReturnType<typeof ctxFor>, id: string,
   ["recordPayment", (s, c, id) => recordPayment(s, c, { orderId: id, amountPaise: 100, method: "cash" })],
   ["recordRefund", (s, c, id) => recordRefund(s, c, { orderId: id, amountPaise: 100, method: "cash" })],
   ["listPayments", (s, c, id) => listPayments(s, c, { orderId: id })],
-  ["getOrderStatusForChannel (by id)", (s, c, id) => getOrderStatusForChannel(s, c, { customerId: b.customerId, orderId: id })],
+  ["getOrderStatusForChannel (by id)", (s, c, id) => getOrderStatusForChannel(s, { ...c, subject: { customerId: b.customerId } }, { orderId: id })],
 ];
 
 describe("tenant B cannot touch tenant A's order through any function", () => {
@@ -195,6 +195,23 @@ describe("cross-tenant references are rejected", () => {
     assert.equal(untouched.items.length, 1);
   });
 
+  it("orders.resource_id: B cannot point an order at A's table, by the engine or by raw SQL (composite FK)", async () => {
+    const d = await inB((s, c) => createOrderDraft(s, c, { items: [{ catalogueItemId: b.tikka, quantity: 1 }], resourceId: b.tableId }));
+    assert.equal(d.resourceId, b.tableId);
+    await rejectsWith(() => inB((s, c) => setFulfilment(s, c, { orderId: d.id, expectedVersion: 1, fulfilment: { type: "dine_in", resourceId: a.tableId } })), "NOT_FOUND", "RESOURCE_NOT_FOUND");
+    await rejectsWith(() => inB((s, c) => createOrderDraft(s, c, { items: [{ catalogueItemId: b.tikka, quantity: 1 }], fulfilment: { type: "dine_in", resourceId: a.tableId } })), "NOT_FOUND", "RESOURCE_NOT_FOUND");
+    const still = await inB((s, c) => getOrder(s, c, { orderId: d.id }));
+    assert.equal(still.resourceId, b.tableId, "a refused change leaves the table alone");
+    // bypassing the engine: the database refuses it too (23503) and never reveals the row
+    await assert.rejects(
+      inB((s) => s.query("update orders set resource_id = $3 where tenant_id = $1 and id = $2", [b.tenantId, d.id, a.tableId])),
+      (err: { code?: string }) => err.code === "23503",
+    );
+    // and tenant A's order lists its own table only
+    const list = await tx(db, a.tenantId, (s) => s.query("select count(*)::int as n from orders where tenant_id = $1 and resource_id = $2", [a.tenantId, b.tableId]));
+    assert.equal(list.rows[0]?.n, 0);
+  });
+
   it("an inline customer on confirm is looked up only inside the tenant", async () => {
     const phone = `+9199${String(Date.now()).slice(-8)}`;
     const inA = await tx(db, a.tenantId, (s) => insert(s, "customers", { tenant_id: a.tenantId, name: "Only In A", phone }));
@@ -226,19 +243,25 @@ describe("getOrderStatusForChannel: minimal fields, only for the owning customer
 
   before(async () => {
     const run = <T>(fn: (s: Client) => Promise<T>) => tx(db, a.tenantId, fn);
-    const c = () => ctxFor(a.tenantId, { channel: "whatsapp" });
+    const as = (customerId: string) => () => ctxFor(a.tenantId, { channel: "whatsapp", subject: { customerId } });
+    const c = as(a.customerId);
     mine = await run(async (s) => {
       const d = await createOrderDraft(s, c(), { items: [{ catalogueItemId: a.tikka, quantity: 2, note: "extra spicy" }, { catalogueItemId: a.soda, quantity: 1 }], customerId: a.customerId, notes: "door code 9921, call me on 9811100001" });
       return placeOrder(s, c(), { orderId: d.id });
     });
+    const c2 = as(a.otherCustomerId);
     theirs = await run(async (s) => {
-      const d = await createOrderDraft(s, c(), { items: [{ catalogueItemId: a.papad, quantity: 1 }], customerId: a.otherCustomerId, notes: "other customer's note" });
-      return placeOrder(s, c(), { orderId: d.id });
+      const d = await createOrderDraft(s, c2(), { items: [{ catalogueItemId: a.papad, quantity: 1 }], notes: "other customer's note" });
+      return placeOrder(s, c2(), { orderId: d.id });
     });
-    anonymous = await run((s) => createOrderDraft(s, c(), { items: [{ catalogueItemId: a.papad, quantity: 3 }] }));
+    anonymous = await run((s) => createOrderDraft(s, ctxFor(a.tenantId), { items: [{ catalogueItemId: a.papad, quantity: 3 }] }));
   });
 
-  const status = (input: Record<string, unknown>) => tx(db, a.tenantId, (s) => getOrderStatusForChannel(s, ctxFor(a.tenantId, { channel: "whatsapp" }), input as never));
+  // `customerId` in these calls is the VERIFIED subject set by the channel layer, not an input of the engine function.
+  const status = ({ customerId, ...input }: Record<string, unknown>) =>
+    tx(db, a.tenantId, (s) =>
+      getOrderStatusForChannel(s, ctxFor(a.tenantId, { channel: "whatsapp", ...(customerId ? { subject: { customerId: customerId as string } } : {}) }), input as never),
+    );
 
   it("returns exactly the safe fields for the owner, by id and by reference (any case)", async () => {
     const byId = await status({ customerId: a.customerId, orderId: mine.id });
@@ -289,11 +312,17 @@ describe("getOrderStatusForChannel: minimal fields, only for the owning customer
     await rejectsWith(() => status({ customerId: a.customerId, orderReference: "' or '1'='1" }), "NOT_FOUND");
   });
 
-  it("needs exactly one of orderId and orderReference, and a customer", async () => {
+  it("needs exactly one of orderId and orderReference, and a verified subject; a customer id in the input is refused", async () => {
     await rejectsWith(() => status({ customerId: a.customerId }), "VALIDATION_FAILED");
     await rejectsWith(() => status({ customerId: a.customerId, orderId: mine.id, orderReference: mine.reference }), "VALIDATION_FAILED");
-    await rejectsWith(() => status({ orderId: mine.id }), "VALIDATION_FAILED");
     await rejectsWith(() => status({ customerId: a.customerId, orderId: mine.id, includeNotes: true }), "VALIDATION_FAILED");
+    // no subject on the context: the same NOT_FOUND as a stranger
+    await rejectsWith(() => status({ orderId: mine.id }), "NOT_FOUND", "ORDER_NOT_FOUND");
+    // the model cannot name a customer in the body
+    await rejectsWith(
+      () => tx(db, a.tenantId, (s) => getOrderStatusForChannel(s, ctxFor(a.tenantId, { channel: "whatsapp" }), { customerId: a.customerId, orderId: mine.id } as never)),
+      "VALIDATION_FAILED",
+    );
   });
 
   it("follows the order: status label updates, and a cancelled order still reports honestly", async () => {
@@ -301,7 +330,7 @@ describe("getOrderStatusForChannel: minimal fields, only for the owning customer
     const s1 = await status({ customerId: a.customerId, orderId: mine.id });
     assert.equal(s1.status, "ACCEPTED");
     assert.equal(s1.version, mine.version + 1);
-    await tx(db, a.tenantId, (s) => cancelOrder(s, ctxFor(a.tenantId), { orderId: mine.id, onBehalfOfCustomerId: a.customerId }));
+    await tx(db, a.tenantId, (s) => cancelOrder(s, ctxFor(a.tenantId, { channel: "whatsapp", subject: { customerId: a.customerId } }), { orderId: mine.id }));
     assert.equal((await status({ customerId: a.customerId, orderId: mine.id })).status, "CANCELLED");
   });
 });

@@ -3,6 +3,7 @@ import { toPaise } from "@qenbel/db";
 import { ErrorCode, OrderStatus, type Channel, type EngineContext, type Paise, type PaymentStatus, type SqlClient } from "@qenbel/shared";
 import { assertTenantSession, notFound, orderError, parseInput } from "./common.ts";
 import { loadPackContext } from "./pack.ts";
+import { actsForCustomer, assertOwnsOrder, limitsFor, requireStaff, requireSubject, subjectCustomerId } from "./scope.ts";
 import {
   getOrderInputSchema,
   listOrdersInputSchema,
@@ -19,7 +20,9 @@ export async function getOrder(sql: SqlClient, ctx: EngineContext, rawInput: Get
   const input = parseInput(getOrderInputSchema, rawInput);
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, false);
-  return buildOrderView(sql, ctx, packCtx, await loadOrderRow(sql, ctx, input.orderId, false));
+  const row = await loadOrderRow(sql, ctx, input.orderId, false);
+  assertOwnsOrder(ctx, row);
+  return buildOrderView(sql, ctx, packCtx, row);
 }
 
 // ---- channel-safe status -------------------------------------------------------------------------------------
@@ -46,9 +49,10 @@ export interface ChannelOrderStatus {
 }
 
 /**
- * Status of ONE order for the customer the channel layer verified (`customerId` comes from the verified contact,
- * never from the model). An order that belongs to someone else, or has no customer, or does not exist, all return the
- * same NOT_FOUND, so the channel cannot probe for other customers' orders.
+ * Status of ONE order for the verified customer in `ctx.subject.customerId` (set by the channel layer from the verified
+ * contact, never from the model). Fails closed on every channel: no subject, an order that belongs to someone else, an
+ * order with no customer, a prefix of a reference and a non-existent order all return the same NOT_FOUND body, so the
+ * channel cannot probe for other customers' orders.
  */
 export async function getOrderStatusForChannel(
   sql: SqlClient,
@@ -57,16 +61,14 @@ export async function getOrderStatusForChannel(
 ): Promise<ChannelOrderStatus> {
   const input = parseInput(orderStatusForChannelInputSchema, rawInput);
   await assertTenantSession(sql, ctx);
+  const customerId = subjectCustomerId(ctx);
+  if (customerId === undefined) throw notFound("ORDER_NOT_FOUND");
   const packCtx = await loadPackContext(sql, ctx, false);
   const res = input.orderId
-    ? await sql.query<OrderRow>("select * from orders where tenant_id = $1 and customer_id = $2 and id = $3", [
-        ctx.tenantId,
-        input.customerId,
-        input.orderId,
-      ])
+    ? await sql.query<OrderRow>("select * from orders where tenant_id = $1 and customer_id = $2 and id = $3", [ctx.tenantId, customerId, input.orderId])
     : await sql.query<OrderRow>("select * from orders where tenant_id = $1 and customer_id = $2 and upper(reference) = upper($3)", [
         ctx.tenantId,
-        input.customerId,
+        customerId,
         input.orderReference as string,
       ]);
   const order = res.rows[0];
@@ -169,8 +171,15 @@ export interface OrderPage {
 
 /** Newest first, stable paging by (created_at, id). Filters: status, customer, created from/to, channel, payment status, reference. */
 export async function listOrders(sql: SqlClient, ctx: EngineContext, rawInput: ListOrdersInput = {}): Promise<OrderPage> {
-  const input = parseInput(listOrdersInputSchema, rawInput);
+  const parsed = parseInput(listOrdersInputSchema, rawInput);
   await assertTenantSession(sql, ctx);
+  // A customer sees only their own orders, in small pages; staff see the tenant's, in pages of at most 100.
+  const input = { ...parsed, limit: Math.min(parsed.limit, limitsFor(ctx).maxListLimit) };
+  if (actsForCustomer(ctx)) {
+    const subject = requireSubject(ctx);
+    if (input.customerId !== undefined && input.customerId !== subject) throw notFound("ORDER_NOT_FOUND");
+    input.customerId = subject;
+  }
   const packCtx = await loadPackContext(sql, ctx, false);
   const where: string[] = ["o.tenant_id = $1"];
   const params: unknown[] = [ctx.tenantId];
@@ -219,6 +228,7 @@ export interface OrderBoardColumn {
 /** The orders board: one column per requested status (default: the live ones), with true counts. */
 export async function getOrderBoard(sql: SqlClient, ctx: EngineContext, rawInput: OrderBoardInput = {}): Promise<OrderBoardColumn[]> {
   const input = parseInput(orderBoardInputSchema, rawInput);
+  requireStaff(ctx, "getOrderBoard");
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, false);
   const statuses: OrderStatus[] =

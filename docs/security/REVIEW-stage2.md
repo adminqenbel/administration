@@ -1,0 +1,227 @@
+# QenBel Administration: security review of Stage 2
+
+Reviewer: `security` agent (adversarial, read-only toward product code). Branch `wip/stage-2`, HEAD `8cb3910` plus the uncommitted db migrations 012 to 016 that had landed when the review ran (they are reviewed as found; the db agent may still change them). Date: 2026-11-07.
+
+Scope reviewed: `packages/db` (migrations 001 to 016, RLS, roles, grants, SECURITY DEFINER functions, seed, `withTenant`), `packages/shared`, `packages/tool-registry`, `packages/engine-catalog`, `packages/engine-bookings`, `packages/engine-orders`, `packages/config-packs` (shape only), `apps/web`, `infra/`, root config, supply chain. `apps/api` was reviewed as a **partial, second-pass** (auth providers, API keys, guard, idempotency, error filter, rate limit, config, credentials, platform, audit, logging); there is no tool gateway, widget, channel webhook, or outbound webhook code yet. `apps/widget` does not exist.
+
+## 1. Executive summary
+
+The foundations are good. Every tenant table has forced RLS and a policy (proven by a catalog query), composite tenant foreign keys work, the runtime role is genuinely limited (no superuser, no BYPASSRLS, no `SET ROLE`, no DDL, cannot touch the audit log or ledger amounts), `withTenant` does not leak `app.tenant_id` between pooled uses on either the commit or the error path, every engine query also filters on `tenant_id`, SQL is parameterised everywhere (the only string-built SQL is column names from code and a fixed table allow-list), the web app has no XSS sinks and a strict self-only CSP, API keys are peppered HMACs compared in constant time, and no real secret is in the repository or its history.
+
+The weaknesses are not in tenant isolation between businesses. They are in three places:
+
+1. **The authorisation boundary between a customer-facing channel and a record is missing in the engines.** Orders have an opt-in `onBehalfOfCustomerId` check that is skipped when the caller leaves the field out (fail-open); bookings have no ownership parameter at all; the AI customer search ignores the "limited to the contact in the conversation" rule that the tool description promises. Everything today relies on UUIDs being unguessable and on an API layer that does not exist yet.
+2. **Anonymous slot denial.** One unauthenticated chat actor can hold any number of slots, each for as long as a whole working shift, with no cap.
+3. **The runtime database role can call the platform-level SECURITY DEFINER functions**, and the `REVOKE ... FROM PUBLIC` meant to protect them is a silent no-op, so any SQL-injection or engine bug in tenant A can suspend tenant B, expire its holds, hold cross-tenant row locks, or read its API key hash.
+
+There are no Critical findings: nothing in the committed code lets an unauthenticated internet user or a normal tenant user read another tenant's data through the intended code paths. Seventeen defect tests (covering SEC-001 to SEC-013 and SEC-018) fail today and are marked `todo`; 19 regression guards pass.
+
+Counts by severity: **Critical 0, High 5, Medium 9, Low 10, Info 3** (27 findings).
+
+Top five (details below):
+
+| # | ID | Finding |
+| --- | --- | --- |
+| 1 | SEC-002 | `qenbel_app` can execute `platform_set_tenant_status`, `platform_create_tenant`, `expire_booking_holds(p_now)` and `auth_lookup_credential`; one statement in tenant A can suspend or disturb tenant B |
+| 2 | SEC-007 | `cancelOrder`/`placeOrder` ownership check is skipped when `onBehalfOfCustomerId` is absent (fail-open); proven: a WhatsApp-channel call cancelled another customer's order |
+| 3 | SEC-004 | Unlimited unconfirmed holds per anonymous actor (30 accepted in the PoC, 5 days ahead), no per-actor, per-conversation or per-tenant cap |
+| 4 | SEC-008 | `engine-bookings` has no caller-ownership parameter: any customer-channel call can cancel, move or confirm a booking given only its id |
+| 5 | SEC-006 | `search_customer` returns other customers' ids, first names, masked contacts and upcoming-booking flag by partial name or exact phone; the documented scoping is not implemented |
+
+## 2. How to reproduce
+
+```
+node docs/security/poc/setup-scratch-db.mjs            # creates the scratch database qenbel_admin_sec_test (add --reset to rebuild)
+node --test docs/security/poc/db-isolation.test.ts docs/security/poc/engine-abuse.test.ts docs/security/poc/api-copies.test.ts
+```
+
+The PoCs only ever connect to `qenbel_admin_sec_test` (each test file asserts `current_database()` first and clears `DATABASE_URL` style variables), read credentials through `@qenbel/db` from `infra/.env`, and print none. `qenbel_admin_test` and other agents' databases are never touched. Results at the time of writing: 36 tests, 19 pass (guards), 17 `todo` failures (defects, listed below), 0 unexpected failures. `[DEFECT SEC-nnn]` tests assert the safe behaviour, fail today, and carry `{ todo: ... }` so the run stays green; remove `todo` when the fix lands. `api-copies.test.ts` tests verbatim copies of two `apps/api` helpers because the API uses decorators that `node --test` cannot load without a build; keep the copies in sync.
+
+| PoC file | Defects shown | Guards |
+| --- | --- | --- |
+| `poc/db-isolation.test.ts` | SEC-001, 002 (x3), 003, 011, 012, 013 | RLS completeness, tenant reads/writes, composite FK, pooled-connection leak (commit and rollback), role privileges, audit/ledger immutability, definer owner and `search_path` |
+| `poc/engine-abuse.test.ts` | SEC-004, 005, 006, 007, 008, 009, 010 | cross-tenant booking ids, strict-schema smuggling, tenant-scope check, LIKE escaping, AI search minimisation, order owner check when supplied, price/quantity tampering, discount cap, overpayment and parallel-refund race |
+| `poc/api-copies.test.ts` | SEC-018 (x2) | plain tenantId refusal |
+
+## 3. Threat model
+
+| Position | Assets at stake | Controls found | Gaps (finding) |
+| --- | --- | --- | --- |
+| (a) Malicious tenant user, valid session | Other tenants' customers, bookings, orders, credentials; platform functions | Forced RLS on all 35 tenant tables; composite FKs; every engine query filters `tenant_id`; permissions enforced by `AccessGuard`; `tenantId`/`orgId` keys refused; strict zod on all engine input | `set_config` can retarget RLS if any SQL is injectable (SEC-003); app role can call platform functions (SEC-002); same external identity may belong to several tenants (SEC-013) |
+| (b) Stolen or over-scoped API credential | Customer PII, bookings, orders, slot supply | 256-bit secret, peppered HMAC, constant-time compare, revocation, expiry, tool allow-list capped to the pack, credentials refused on routes without `@AllowApiCredential()`, 600 req/min/principal | Voice/API-key `search_customer` is unscoped (SEC-006); no ownership binding (SEC-007/008); pepper rotation invalidates all keys (SEC-021); no per-credential spend or write budget (SEC-014) |
+| (c) Hostile end customer driving the AI | Slot availability, other customers' records, staff attention, token cost | Narrow tools, zod `.strict()`, server prices, max lengths on every tool string (a test walks the JSON Schema), default channel matrix removes read/cancel tools from web chat and voice, PII masked in AI search | Hold hoarding and long holds (SEC-004/005); fail-open ownership (SEC-007/008); no loop, escalation or token guards yet (SEC-014); untrusted text echoed to the model (SEC-025) |
+| (d) Unauthenticated internet user | Availability, enumeration | `Public()` routes limited to health today; per-IP rate limit; auth-failure lockout; uniform 401 | Widget path not built: shared per-key bucket and IP lockout can be used to starve legitimate visitors (SEC-015) |
+| (e) Malicious or buggy webhook sender (inbound) or receiver (outbound) | Tenant data integrity, internal network | Signing design (HMAC, 5 min window, constant-time, event id) is sound; inbound verification described | Nothing implemented; per-tenant secret lookup before verification (SEC-016); SSRF (SEC-012); secret storage design (SEC-019) |
+| (f) Insider with DB read access | PII, key hashes, webhook secrets | `secret_hash` only, no plaintext keys; webhook secrets encrypted by design; `details` redacted; masked contacts in events | `auth_lookup_*` reachable by runtime role (SEC-002); one shared DB password in dev defaults (SEC-017); idempotency table keeps full response bodies, including customer PII, for 24 h (retention note, not a finding) |
+
+## 4. Findings
+
+Ranking: Critical (cross-tenant data exposure or auth bypass reachable now), High (exploitable by a realistic attacker once the layer above is wired, or already exploitable for business harm), Medium (needs a second weakness or is a design gap that will bite in Stage 3 or 4), Low (hardening, limited impact), Info.
+
+### High
+
+#### SEC-002  The runtime role can execute the platform-level SECURITY DEFINER functions
+- **Where:** `packages/db/migrations/011_rls_roles_grants.sql:192-217` (EXECUTE granted to `qenbel_app`), functions at `:107-175`; `007_bookings.sql:220` and `016_hold_sweep_lock_order.sql` (`expire_booking_holds(p_now)`); `packages/db/src/tenant.ts:60` (`expireBookingHolds(pool, now?)` passes a caller-chosen time).
+- **Attacker:** any code or SQL running as `qenbel_app` inside tenant A: an engine bug, an injectable statement, a compromised dependency, or a mistake in a future route.
+- **Exploit (proven, `db-isolation.test.ts`, three `SEC-002` tests):** inside `withTenant(A)`: `select platform_set_tenant_status('<B>', 'suspended')` succeeds and locks tenant B out of every login (`auth_lookup_*` joins on `status = 'active'`); `select expire_booking_holds('2999-01-01')` expires every live hold of every tenant (bypasses RLS because the function runs as BYPASSRLS `qenbel_platform`); `select secret_hash from auth_lookup_credential('<lookup id>')` returns B's key hash and tool scopes. Since 016, `expire_booking_holds` also takes `FOR NO KEY UPDATE` row locks on the resources of all expiring holds across tenants, so a caller holding the transaction open (30 s idle limit) blocks hold creation for every tenant.
+- **Impact:** a single-tenant compromise becomes a platform-wide denial of service and a cross-tenant credential-hash read. `platform_create_tenant` also lets the runtime role create tenants. The API's `PLATFORM_ADMIN` guard is the only control, and the database function "cannot check it" (its own comment).
+- **Fix:** use separate connection roles by purpose. (1) Request/tenant work: `qenbel_app`, with EXECUTE only on `current_tenant_id`, `app_set_tenant`, `expire_booking_holds_for_current_tenant`. (2) Authentication lookups: a second LOGIN role (for example `qenbel_auth`) that may execute only `auth_lookup_user/credential/is_platform_admin`, used by a separate small pool in `AuthenticationService`. (3) Platform and worker work (`platform_create_tenant`, `platform_set_tenant_status`, `platform_list_active_tenants`, `expire_booking_holds`, `purge_expired_idempotency_keys`): a third LOGIN role (`qenbel_platform_api`) used only by the platform controller and the sweep job. Remove the `p_now` parameter from the cross-tenant sweep (always `clock_timestamp()`), and drop the `now` argument of `expireBookingHolds`. Add `qenbel_app`-cannot-execute assertions to `packages/db/test/rls.test.ts`.
+- **Owner:** `db` (migration, roles in `infra/postgres/init`), then `api-core` (two extra pools).
+
+#### SEC-007  Order ownership checks are fail-open
+- **Where:** `packages/engine-orders/src/lifecycle.ts:61-63` (`assertOwner`), `:262-288` (`placeOrder`), `:323-330` (`cancelOrder`); `schemas.ts:159,183` (`onBehalfOfCustomerId` is an optional body field).
+- **Attacker:** a customer on WhatsApp or the API-key channel, or a prompt-injected agent.
+- **Exploit (proven, `engine-abuse.test.ts` SEC-007):** `cancelOrder(sql, whatsappCtx, { orderId })` on Asha's placed order returns `CANCELLED` (a paid order also gets a refund ledger entry, recorded without staff approval). With `onBehalfOfCustomerId` set to another customer the same call correctly returns NOT_FOUND (guard test), so the check works only if the API layer never forgets it. `onBehalfOfCustomerId` also sits in the same strict body object as model-supplied fields, so a gateway that forwards the tool body unfiltered lets the model choose whose orders it acts for.
+- **Impact:** any customer-facing credential can cancel, place or (via refund side effect) alter the ledger of any order in the tenant given its id. Ids are v4 UUIDs, so exposure today is limited to leaks (logs, webhooks to other endpoints, shared conversation) and to `reference` brute force through other tools; the control is nevertheless one forgotten argument away from failing.
+- **Fix:** make the verified customer part of `EngineContext` (for example `ctx.actor.customerId`, set only by the channel layer), and make every order and booking function that accepts a customer-channel actor (`ctx.actor.channel` in `web_chat|whatsapp|voice|api`) require it: when channel is not `dashboard`, a missing `ctx.actor.customerId` is `FORBIDDEN`, and a non-matching order is NOT_FOUND. Remove `onBehalfOfCustomerId` from the input schemas so it cannot arrive in a body. Add a test that every customer-channel entry point rejects a context without a verified customer.
+- **Owner:** `engine-orders` (and `shared` for the context type); `api-core` to populate it.
+
+#### SEC-008  The booking engine has no caller-ownership concept
+- **Where:** `packages/engine-bookings/src/cancel.ts`, `reschedule.ts`, `confirm.ts`, `queries.ts:getBooking`: all take only `bookingId`; `loadBooking` filters by tenant and id (`repo.ts:81-95`). `CONTACT_MISMATCH` exists in the tool registry (`tools.ts` error lists for confirm, reschedule, cancel) but no engine code raises it (`grep` finds none).
+- **Exploit (proven, SEC-008):** a `whatsapp` context cancelled Alice's confirmed booking with only its id. The same holds for reschedule and for confirming someone else's live HOLD with different customer details.
+- **Impact:** identical to SEC-007 for bookings; also a free way to destroy a competitor customer's appointment once any id is known. `getBooking` returns notes, customer id and deposit data to any caller in the tenant.
+- **Fix:** same pattern as SEC-007: verified customer in the context, bookings carry `customer_id` (holds created by a customer channel should store the conversation or the contact so `confirm` can check the hold belongs to the same conversation). Raise `CONTACT_MISMATCH` as NOT_FOUND-equivalent so existence is not revealed.
+- **Owner:** `engine-bookings`.
+
+#### SEC-004  Unlimited unconfirmed holds per actor (slot denial by an unauthenticated user)
+- **Where:** `packages/engine-bookings/src/holds.ts:45-146`; no cap anywhere (`grep` for any hold limit finds nothing); `window.ts` applies lead time and advance only.
+- **Attacker:** anyone holding the public widget key (by design public), or any API credential.
+- **Exploit (proven, SEC-004):** 30 sequential `createHold` calls as a `web_chat` actor with no customer, different slots across three days on one resource, all accepted. With the default 60 req/min per address and holds that live `holdMinutes` (pack default), a script keeps every slot of every resource blocked for up to `maxAdvanceDays` (90 by default); each hold costs the attacker one request every 10 to 30 minutes.
+- **Impact:** a business can be made unbookable from its own website and WhatsApp bot while looking fully booked; availability queries show nothing. This is the highest realistic business-harm path for Stage 4.
+- **Fix:** enforce, in the engine, per tenant-configurable limits for non-dashboard channels: maximum open holds per (actor, conversation or verified contact) (suggest 2), per client address or widget session (suggest 3), and per tenant per hour; reject the next hold with `RATE_LIMITED` and a plain message. Shorten the hold for unverified channels. Require a customer contact before a customer channel can hold more than one slot. Add the `conversation_id`/`customer_id` already present on `bookings` to the count query (index `bookings_open_holds` exists).
+- **Owner:** `engine-bookings` (caps), `api-core` (per-session counters for the widget).
+
+#### SEC-006  `search_customer` is not scoped to the conversation contact
+- **Where:** `packages/engine-catalog/src/customers.ts:405-437` (`searchCustomersForAi`); promise at `packages/tool-registry/src/tools.ts:152` ("On WhatsApp and API calls the server limits results to the contact in the conversation"). Default channels for the tool: `VERIFIED_CONTACT_CHANNELS` (WhatsApp, API key).
+- **Exploit (proven, SEC-006):** from a `whatsapp` context, `{ name: "bh" }` returns "Bob ******0002" and `{ phone: "+919811100001" }` returns "Alice ******0001", with `customerId` and `hasUpcomingBooking`. Two-letter prefixes enumerate the customer base 5 rows at a time; an exact phone is a membership oracle that also yields the first name and the customer id.
+- **Impact:** PII existence and identity disclosure to any chat or API credential; customer ids obtained here are the capability the weak ownership model (SEC-007/008) relies on, and they can be fed to `create_booking_hold.customerId`.
+- **Fix:** do not accept free-text name search from customer channels at all. For WhatsApp, resolve the customer from the verified sender number inside the channel layer and return only that record (no input needed). For API-key channels (voice), allow only exact phone or email and return `found: true/false` plus a first name only when the caller already supplied the matching identifier; never return `customerId` to the model (keep it server-side keyed by conversation). Remove `customerId` from `create_booking_hold` tool input. Update the tool description to match.
+- **Owner:** `engine-catalog` (search), `tool-registry` (schema), `api-core` (conversation-bound contact).
+
+### Medium
+
+#### SEC-001  `REVOKE ... FROM PUBLIC` on the SECURITY DEFINER functions is a silent no-op
+- **Where:** `011_rls_roles_grants.sql:183-217`. The functions are created by `qenbel_migrate`, ownership moves to `qenbel_platform` (`:183-190`), and only then `REVOKE`/`GRANT` run as `qenbel_migrate`, which is a member of `qenbel_platform` with `INHERIT FALSE` (`infra/postgres/init/01-roles-and-databases.sh`). PostgreSQL gives only a warning when the grantor lacks the privilege, so nothing changed.
+- **Evidence (proven, SEC-001):** `pg_proc.proacl` of all eight definer functions is `{=X/qenbel_platform,qenbel_platform=X/qenbel_platform}`: PUBLIC can execute them; the `GRANT ... TO qenbel_app` also did not apply (the app role works only because of PUBLIC). Migration 016's `CREATE OR REPLACE` preserves this.
+- **Impact:** any role that can connect and is added later (a reporting or read-only role) can call `platform_create_tenant`, `auth_lookup_credential` and the rest. Today `CONNECT` is limited to `qenbel_migrate` and `qenbel_app`, so the live exposure equals SEC-002, but the stated control does not exist, and the existing db tests did not notice.
+- **Fix:** new migration (do not edit 011): `REVOKE ALL ON FUNCTION ... FROM PUBLIC` and the intended GRANTs executed while the role is the owner (`SET LOCAL ROLE qenbel_platform` as 016 already does, or run before `ALTER FUNCTION ... OWNER TO`). Add `ALTER DEFAULT PRIVILEGES FOR ROLE qenbel_migrate IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` (and the same for `qenbel_platform`). Make the guard in `db-isolation.test.ts` ("only `current_tenant_id()` is PUBLIC-executable"; "definer functions not PUBLIC-executable") part of `packages/db/test`.
+- **Owner:** `db`.
+
+#### SEC-003  Blast radius of any injectable SQL: the tenant is an ordinary GUC
+- **Where:** `packages/db/src/tenant.ts:28-52`; `001_extensions_helpers.sql:20` (`current_tenant_id()`); the policies in 011.
+- **Exploit (proven, SEC-003, expected to remain failing until a design change):** inside `withTenant(A)`, `select set_config('app.tenant_id', '<B>', true)` then `select * from customers` returns B's rows. Also `app_set_tenant(uuid)` is executable by the runtime role and does the same.
+- **Impact:** RLS protects against missing `WHERE` clauses, not against attacker-controlled SQL. Today no injectable SQL was found (all values parameterised), so this is the accepted ceiling of the GUC pattern, recorded so it is a conscious decision.
+- **Fix (choose):** (1) Keep the pattern, and enforce "no string-built SQL, no `SET`/`set_config` outside `withTenant`" with a lint or test that scans `packages/*/src` and `apps/*/src` for template-literal SQL and for `set_config`; revoke EXECUTE on `app_set_tenant` from `qenbel_app` (nothing in the runtime needs it). (2) Stronger, optional: bind the tenant to a value the SQL-only attacker cannot forge, for example have `current_tenant_id()` also require `current_setting('app.tenant_proof')` equal to `encode(hmac(tenant_id, key), 'hex')` where `key` is held only by the API process and verified in a SECURITY DEFINER function using a key stored in a table the app role cannot read. Cost: one HMAC per statement (STABLE, evaluated once). Worth doing before untrusted SQL-adjacent features (reports, query builders) exist.
+- **Owner:** `db`, `api-core`.
+
+#### SEC-005  Customer channels can choose their own hold duration
+- **Where:** `packages/engine-bookings/src/schemas.ts:19,29-30` (`durationMinutes` up to 1440, free `endsAt`); `holds.ts:59-67`; `window.ts` only requires the interval to fit inside working hours.
+- **Exploit (proven, SEC-005):** one `web_chat` call with no service and `durationMinutes: 600` held 600 minutes of Staff A's day. The tool schema (`create_booking_hold`) does not expose duration, but the engine accepts it, so a gateway that forwards extra fields (or a different adapter) re-opens it.
+- **Impact:** amplifies SEC-004 by up to 10 times per request; with `partySize` up to 100 a shared resource can be filled by one hold.
+- **Fix:** for non-dashboard channels the engine derives length from the catalogue item only (`catalogueItemId` required; `endsAt` and `durationMinutes` rejected), and caps `partySize` to the resource capacity before inserting.
+- **Owner:** `engine-bookings`.
+
+#### SEC-010  Idempotency rows are not bound to the principal
+- **Where:** `010_platform_infra.sql` (`UNIQUE (tenant_id, key, route)`), `apps/api/src/idempotency/idempotency.interceptor.ts:52-53` (hash of method, route, query, body), `packages/engine-bookings/src/idempotency.ts:31-32`, `packages/engine-orders/src/common.ts:136-190` (replay re-loads the entity by id).
+- **Exploit (proven, SEC-010):** credential "widget" repeated credential "voice"'s key and identical body and was handed voice's booking. `docs/INTEGRATIONS.md` recommends predictable keys (`call-<call id>-hold-1`), and Stage 4 plans to derive keys from provider call ids; the public widget credential can therefore pre-claim or replay another channel's key. A different body returns `IDEMPOTENCY_CONFLICT`, which also tells the attacker the key exists.
+- **Fix:** add the principal id (credential id or user id, plus conversation id for channels) to the idempotency key, i.e. `UNIQUE (tenant_id, principal, key, route)` or fold it into `request_hash` and treat a mismatch as a plain miss (new row under a key suffix), never as replay or conflict. For replay, return the stored response only if the original principal matches. In the Stage 4 voice adapter, derive keys with an HMAC over (credential id, call id, tool, body hash).
+- **Owner:** `db` (constraint), `api-core`, `engine-bookings`, `engine-orders`.
+
+#### SEC-012  Webhook endpoint URLs allow internal targets (SSRF), dispatcher not built
+- **Where:** `010_platform_infra.sql:86` (`url ~ '^https?://'`); no engine or API validates it.
+- **Exploit (proven, SEC-012):** the database stores `http://169.254.169.254/latest/meta-data/`, `http://localhost:5432/`, `http://10.0.0.5/admin`.
+- **Impact:** when the dispatcher exists, an OWNER (or anyone with `integrations:manage`) can make the server call internal services; the response excerpt (`response_excerpt`, 1000 chars) is stored and shown, which turns blind SSRF into read SSRF.
+- **Fix:** require `https://` (allow `http://localhost` only when `NODE_ENV=development`); validate on create and again at every delivery after DNS resolution (reject loopback, link-local, private, CGNAT, metadata, unique-local and IPv4-mapped IPv6 ranges; pin the connection to the validated IP to defeat rebinding); no redirects; response size cap; do not store response bodies for non-owner-visible endpoints; fixed outbound timeout (10 s as documented). Add a DB `CHECK (url ~ '^https://')` as a backstop.
+- **Owner:** `api-core` / worker (dispatcher), `db` (CHECK).
+
+#### SEC-013  One external identity can map to several tenants, and the API picks one arbitrarily
+- **Where:** `003_tenant_core.sql` (`UNIQUE (tenant_id, auth_provider, external_subject)`), `011:138-146` (`auth_lookup_user` returns all matches, no `ORDER BY`), `apps/api/src/auth/authentication.service.ts:96` (`users.rows[0]`).
+- **Exploit (proven, SEC-013):** the same Clerk subject in two tenants returns two rows. A malicious owner who learns a victim's Clerk user id (ids are not secret) adds the victim to their business; the victim, if they also belong to another business, may land in the attacker's tenant on login and enter their own customers' data there (tenant confusion, with a role the attacker chose).
+- **Fix:** decide the rule. Either globally unique `(auth_provider, external_subject)` (one person, one business, simplest and matches "tenant comes from the principal"), or multi-membership with an explicit tenant selection that is server-verified (a `selectedTenantId` is accepted only if it is among the caller's memberships) and invitations that bind a subject only after the invitee proves control of the invited e-mail. In either case make `auth_lookup_user` deterministic.
+- **Owner:** `db`, `api-core`.
+
+#### SEC-014  No cost or runaway-loop guards for the AI surface (required before Stage 4)
+- **Where:** absent. `conversations.input_tokens/output_tokens` columns and `AI_TENANT_DAILY_TOKEN_CAP` in `.env.example` exist, nothing enforces them. `escalate_to_human` creates a new follow-up task every call (`packages/engine-catalog/src/crm.ts:136`); there is no deduplication per conversation.
+- **Impact:** a hostile or looping conversation can burn the tenant's model budget, spam staff with tasks, create unbounded holds and drafts (`create_order_draft` has no cap either), and fill `conversation_messages` (20 kB per row).
+- **Fix (requirements for the agent runtime):** max tool calls per user message (suggest 8) and per conversation (suggest 40); max write tool calls per conversation (suggest 6); loop detector (same tool and arguments three times in a row stops the run); max user message length and messages per minute per session; per-tenant and per-credential daily token budget enforced before calling the model; `escalate_to_human` at most once per conversation per 30 minutes and flagged on the existing task; per-conversation caps on open holds and drafts (see SEC-004); all counters stored server-side (not in the model context); tool results capped in size.
+- **Owner:** Stage 4 agent runtime; `engine-catalog`/`engine-bookings`/`engine-orders` for the per-conversation caps.
+
+#### SEC-015  Rate limiting design problems for public and proxied use
+- **Where:** `apps/api/src/authz/access.guard.ts:93,101-111,140`; `config.ts` (`TRUST_PROXY`, default 0).
+- **Issues:** (1) the principal bucket is keyed by credential id, so one widget key (shared by every visitor of a site) has a single 600/min budget: one attacker can exhaust it and the site's chat stops for everyone. (2) The failed-authentication lockout is per client address (`authfail:<ip>`, 20/min): behind a reverse proxy with `TRUST_PROXY=0` every user shares the proxy address, so 20 bad tokens lock everyone out; with `TRUST_PROXY` too high, a client can spoof `X-Forwarded-For` and evade or poison limits. (3) The limiter is fixed-window, which allows 2x bursts at window edges.
+- **Fix:** widget traffic gets a second bucket per (widget key, visitor session or address) and the per-key bucket is only a ceiling; document and test the exact `TRUST_PROXY` hop count for the chosen deployment (and refuse to start in production behind a proxy with 0); key the lockout on (address, token prefix or credential lookup id) rather than address alone; consider a sliding window.
+- **Owner:** `api-core`.
+
+#### SEC-016  Inbound channel webhooks: per-tenant secret lookup happens before verification
+- **Where:** `docs/INTEGRATIONS.md` section 4: "verified with a constant-time compare before parsing", "tenant found from the phone number id", a single `WHATSAPP_APP_SECRET`; `docs/CONTRACT-REQUESTS.md` leaves per-tenant secret storage undecided.
+- **Issue:** if each business uses its own Meta app, the secret depends on the tenant, and the tenant is only known from the (still unauthenticated) body. Parsing before verifying reopens the "parse untrusted input first" problem; a single global secret is fine only if QenBel is one Meta app for all tenants.
+- **Fix:** route per channel by an unguessable id in the path (`/v1/channels/whatsapp/webhook/{channelId}`, 128-bit random, stored with the encrypted secret), look up the secret by that id, verify over the raw body, only then parse. Dedupe on provider message id with retention at least as long as the provider's retry window, and reject payloads older than a threshold. Decide encrypted-column versus secret manager before Stage 4 (see SEC-019). Verify-token comparison for the GET handshake must also be constant-time.
+- **Owner:** coordinator (decision), `api-core` / Stage 4.
+
+### Low
+
+| ID | Finding | Where | Evidence and fix | Owner |
+| --- | --- | --- | --- | --- |
+| SEC-009 | A customer-channel confirm with a new phone and an e-mail that already belongs to another customer escapes as a raw `23505` (HTTP 500), an oracle for "this e-mail is a customer" | `engine-bookings/src/confirm.ts:70-106` (lookup by phone only, insert with e-mail); unique index from migration 014 (proven, SEC-009) | Look up by phone and e-mail like `engine-catalog.createCustomer`, map `23505` on `customers_active_*_unique` to the same outcome as the match path (or to a neutral error), same in `engine-orders/src/lookups.ts:169-200`. | `engine-bookings`, `engine-orders` |
+| SEC-011 | The database does not enforce the order or booking state machines or ledger consistency; `update orders set status='FULFILLED', payment_status='paid'` from DRAFT with no payment row is accepted | `007`, `008`, grants in 011 (table-level UPDATE) (proven, SEC-011) | Add transition triggers on `orders.status` and `bookings.status`, restrict `UPDATE` to named columns, and derive `payment_status` from the ledger in a trigger. Defence in depth only; engines enforce it today. | `db` |
+| SEC-017 | Dev defaults: `qenbel_app`, `qenbel_migrate` and `qenbel_platform` passwords all default to the superuser `POSTGRES_PASSWORD` (confirmed: the same value connects as each); Postgres `ssl=off`; images use mutable tags (`postgres:17`, `redis:7-alpine`, `cgr.dev/chainguard/minio:latest`); MinIO is unused by any code but exposed on 127.0.0.1:9100/9101; containers run with default capabilities | `infra/postgres/init/01-roles-and-databases.sh:11-13`, `infra/docker-compose.yml:8,31,48` | Require distinct `QENBEL_*_PASSWORD` values (fail the init script if unset in anything but a dev flag), pin images by digest, verify the Chainguard image with `cosign verify`, drop MinIO from compose until used, add `security_opt: no-new-privileges`, `cap_drop: [ALL]` where possible, and document `sslmode=verify-full` for non-local `DATABASE_URL`. All ports are correctly bound to 127.0.0.1. | coordinator (`infra`) |
+| SEC-018 | The tenant-key scan stops after 5000 nodes or 8 levels, and the log scrubber's PEM rule is quadratic with truncation after it (238 KB string blocks the event loop about 1 s) | `apps/api/src/authz/access.guard.ts:33-45`; `apps/api/src/common/logger.ts:17,23` (proven by copies, `api-copies.test.ts`) | Fail closed when the budget or depth is exceeded (strict zod schemas remain the real control); truncate to 2000 characters before running scrubbers and make the PEM rule non-backtracking. | `api-core` |
+| SEC-019 | Webhook secret storage has no key id, no per-row context and a single env master key | `010:89` (`secret_ciphertext`), `.env.example` (`WEBHOOK_SIGNING_MASTER_KEY`), contract's two-secret rotation | Add `key_version` and a second secret column for rotation; use AES-256-GCM with a random 96-bit nonce and AAD = tenant id + endpoint id; keep the key out of the DB host. Same design decision applies to per-tenant WhatsApp and voice tokens (open item in CONTRACT-REQUESTS). | `db`, `api-core` |
+| SEC-020 | A customer channel can attach a booking or order to an existing customer by claiming their phone number | `engine-bookings/src/confirm.ts:70-85`, `engine-orders/src/lookups.ts:169-180` | No existing record is changed and nothing is returned, but the victim receives notifications and sees planted bookings. On WhatsApp the phone is verified; on web chat and voice it is not: treat the phone as unverified (create a separate pending customer, merge by staff) or send a confirmation to the number first. | `engine-bookings`, `engine-orders`, product decision |
+| SEC-021 | API-key pepper rotation invalidates every key; `last_used_at` is never written | `authentication.service.ts:154`, `api-key.ts` | Hold a map of pepper versions in config and verify with the version stored in the row; update `last_used_at` (throttled) so owners can spot a stolen key. | `api-core` |
+| SEC-022 | Engine errors copy Postgres constraint names into client-visible `details` | `engine-catalog/src/common.ts:43-65`, `engine-orders/src/common.ts:46-55` (the API's own `pg-errors.ts` correctly omits them) | Remove `constraint` from `details`, log it instead. | `engine-catalog`, `engine-orders` |
+| SEC-023 | `npm audit`: 6 findings (2 low, 4 moderate), all in the build-time chain `vite-plugin-pwa` > `workbox-build` > `@rollup/plugin-node-resolve` > `deepmerge` (prototype poisoning), `glob`, `minimatch` | root lockfile | Not shipped to production runtime; `npm audit fix --force` would downgrade `vite-plugin-pwa`, so track upstream and re-run in CI. | coordinator |
+| SEC-024 | No CI: no automated test run, `npm audit`, secret scan, or lockfile integrity check; two packages have install scripts (`msgpackr-extract`, optional `fsevents`); `@clerk/backend` and `bullmq` are declared in `apps/api` but unused | repo root, `apps/api/package.json` | Add a CI workflow (tests with a Postgres service, `npm ci --ignore-scripts`, `npm audit --omit=dev`, gitleaks) before any push; remove unused dependencies until used. | coordinator |
+
+### Info
+
+- **SEC-025  Untrusted text reaches the model through tool outputs.** `get_order_status` returns `order_items.notes` (customer-written, up to 1000 chars), `search_customer` returns a first-word display name (customer-written), booking and catalogue text reaches `get_business_profile`/`get_catalogue`. These are bounded and plain text, which limits the damage, but they are prompt-injection carriers. Runtime guidance: wrap tool results as data in the prompt, never act on instructions found in them, and keep the narrow-tool design (the ownership fixes above are what actually limit the impact of an injected call).
+- **SEC-026  Web hardening.** `apps/web/public/_headers` lacks `Strict-Transport-Security` and `Cross-Origin-Resource-Policy`; the strict CSP is set by `<meta>` in builds, and the header-only `frame-ancestors 'none'` exists only in `_headers` while the deployment target is undecided; `style-src 'self'` means any future inline `style=` is blocked (none today). Add HSTS and confirm the final host sends the same headers. Service worker precaches the static shell only and denies `/v1/` (verified OK).
+- **SEC-027  `seed` is not guarded against non-development databases** (only `--reset` is). It creates dev identities and a fixed widget key (`wk_demo_salon_0001`) and a dev platform admin. Dev tokens cannot authenticate under the Clerk provider (different `auth_provider` value) so this is not exploitable, but add the same `assertLocalDevDatabase` check to plain `seed`.
+
+Observation outside this repo: a container `backend-db-1` on the same machine publishes Postgres on `0.0.0.0:5433`. It is not part of QenBel Administration, but it is reachable from the LAN.
+
+## 5. Verified OK (what was actually checked)
+
+Database (`packages/db`)
+- All 35 tables carrying `tenant_id` have `ENABLE` and `FORCE ROW LEVEL SECURITY` and a `tenant_isolation` policy with `USING` and `WITH CHECK`, including the three tables added by migration 013; `tenants` has its own self policy. Guarded by a catalog query in `db-isolation.test.ts`.
+- `app_secure_tenant_table()` is not executable by PUBLIC or the runtime role; migration 013's `app_move_resource_extras()` is owner-only; the temporary `NO FORCE RLS` windows in 013, 014 and 015 sit inside the migration transaction and are re-forced (checked in the files; final state asserted by the RLS guard).
+- Cross-tenant insert is refused by `WITH CHECK`; cross-tenant update touches zero rows; composite FKs make a booking in tenant A reference tenant B's customer fail with `23503`.
+- `withTenant`: UUID validated before use, `set_config(..., true)` is transaction-local, on both COMMIT and ROLLBACK the next user of the same pooled connection sees an empty setting and zero rows (proven with a pool of one); a connection whose ROLLBACK fails is destroyed; statement and idle-in-transaction timeouts are set.
+- `qenbel_app` is not superuser, createrole, or BYPASSRLS; cannot `SET ROLE` to `qenbel_platform` or `qenbel_migrate`; cannot create tables or schemas; cannot update or delete `audit_log` (privilege and append-only trigger), edit `payments` amounts, delete bookings, or read `platform_admins`.
+- All eight SECURITY DEFINER functions are owned by `qenbel_platform`, pin `search_path = public, pg_temp` (temp schema last), and take no dynamic SQL. The runtime role has no CREATE on any schema, so `current_tenant_id()` cannot be shadowed.
+- Idempotency keys are independent per tenant; the `idempotency_keys` unique constraint is the only conflict surface the API maps.
+- DB `CHECK` constraints back the money rules (`>= 0`, total consistency, line consistency, `amount_paise > 0`), `period` validity, and exclusion constraints for double booking.
+
+Engines
+- No string-built SQL from input. Template literals feeding `query()` interpolate only constants (`ITEM_COLS`, `set.clause` built from code-chosen column names, a fixed table allow-list in `assertRef`, savepoint names from an in-process counter). Dynamic `ORDER BY` does not exist. LIKE patterns are escaped with `likeEscape` and `escape '\'` (proven with `%%`, `__`, `\%`).
+- Cursors are base64url JSON, values bound as parameters, uuid casts validated or mapped to `VALIDATION_FAILED`; the bookings cursor is tied to a filter fingerprint; tenant filter is always applied.
+- `attributes` keys are restricted by regex (`^[A-Za-z][A-Za-z0-9_]{0,39}$`, no `__proto__`) and there is no deep merge anywhere in the code (grep); no prototype-pollution path found.
+- Prices, tax, totals are server-side; `.strict()` rejects `tenantId`, `status`, `unitPricePaise`, `totalPaise`; quantity 0, negative, fractional, above 999 rejected; order total capped at 10^12 paise; arithmetic uses safe-integer checks and BigInt allocation, so JS-number overflow of bigint paise is refused (`VALIDATION_FAILED`) instead of wrapping; discount above 20% of subtotal needs `capOverride` and can never exceed the subtotal.
+- Payments and refunds lock the order row; overpayment and over-refund are refused; two parallel full refunds produce exactly one entry (proven).
+- Every engine call first asserts that the SQL client's `app.tenant_id` equals `ctx.tenantId` (bookings `assertScope`, orders `assertTenantSession`; the catalogue engine checks only that `ctx.tenantId` is a UUID and relies on the explicit `tenant_id` filters plus RLS); a mismatched context stops with `TENANT_REQUIRED` (proven for bookings).
+- Double-booking and hold expiry are decided in the database; confirm refuses an expired hold; late-cancellation `block` applies to customer channels.
+- Tool registry: every string, array and number in input and output is bounded (a test walks the JSON Schema), inputs are `strictObject`, `tenantId` is in no schema, the default channel matrix keeps cancel, reschedule, order status and customer search off web chat and voice, `search_customer` output is masked.
+
+API (partial)
+- Deny by default: a route with no declared policy is refused and logged; API credentials are refused unless the route says `@AllowApiCredential()`; permissions come from the principal built from the database row, never from the request; `tenantId`/`orgId` keys are refused in body and query.
+- API keys: 256-bit secret, lookup id bound into an HMAC with the pepper, `timingSafeEqual`, dummy comparison on malformed or unknown ids, revoked/expired/wrong-type/wrong-pepper all return the same 401, secret shown once, never stored or logged, key creation is not `@Idempotent` on purpose.
+- Clerk verification pins RS256, requires `exp`, `sub`, `iss`, `azp` in an allow-list and a `user_` subject; dev provider only constructible when `NODE_ENV=development`, bound to loopback, and peer is loopback; unset `NODE_ENV` is treated as production; config refuses `AUTH_PROVIDER=dev` otherwise (also re-checked at app start).
+- Bearer tokens only (no cookies), CORS limited to one exact origin without credentials, JSON-only bodies with a size limit (256 KB default), JSON-only error format with no pg detail, body and headers never logged, secret-shaped keys and strings redacted.
+- Idempotency: key syntax validated, hash covers method, route, query and body, different request under the same key is a 409, concurrent duplicates wait or conflict, 5xx/401/403/429 are not stored, key creation endpoint is excluded.
+
+Web
+- No `dangerouslySetInnerHTML`, `innerHTML`, `eval`, `document.write`, `window.open`, dynamic `href` from data; user text is rendered through React. CSP: self only, no inline script or style, no third-party origin (a test fails on external URLs). Dev auth requires both Vite's `DEV` flag and a loopback hostname and stores only a display stub in `sessionStorage`; production builds cannot take that path. Service worker precaches the build only, `runtimeCaching: []`, API paths denied. Only a non-sensitive pack choice is in `localStorage`. No source maps in builds.
+
+Secrets and supply chain
+- `infra/.env` is git-ignored and was never committed (checked in all 8 refs); `git grep` for key patterns across history finds only fake fixtures in tests; `.env.example` holds names only; no hard-coded production secret; compose ports bind 127.0.0.1; Redis requires a password; lockfile present with integrity hashes for every registry package.
+
+## 6. Gaps not reviewed
+
+- **Not built yet, so not reviewable:** the tool gateway (`/v1/tools/*`), widget key authentication and the public chat routes, WhatsApp and voice webhooks, the outbound webhook dispatcher and its encryption, the agent runtime, MCP server, widget, user and team management (invitation flow matters for SEC-013), the remaining dashboard routes. Every "API layer will..." assumption in SEC-006/007/008 must be re-checked when those exist; the route-permission test and a customer-channel ownership test should be written first.
+- `apps/api` second pass was partial: `rate-limiter` Redis script and failure modes were read but not stress-tested; `shutdown.ts` and `core.module.ts` wiring were not reviewed.
+- `packages/engine-catalog` `catalogue.ts`, `business.ts`, `resources.ts`, `availability.ts` were skimmed for SQL construction and input bounds only; business-logic review (hours, holidays, schedule overlap) and the availability algorithm (`availability-core.ts`, cost per request on tenants with very many resources) were not analysed in depth. `engine-catalog` still reads the interim `attributes.timeOff/serviceIds` keys that migration 013 moves into tables; confirm the engine switch lands with the migration.
+- Migrations 012 to 016 were reviewed as untracked files and 013/016 changed while the review ran; the PoCs re-run cleanly on a rebuilt scratch database. Re-run after the db agent finishes.
+- `packages/ui`, `packages/config-packs` content (pack text and defaults), BRAND/STAGES documents, `docs/generated/tools.openapi.json`, Redis and MinIO configuration beyond compose, TLS termination, backups, and any production deployment are out of scope or not present.
+- Load and timing tests: authentication timing equivalence was reasoned from code, not measured; the PEM-regex timing was measured. No fuzzing of engine inputs beyond targeted cases.
+- Concurrency beyond what the engines' own suites cover: only the parallel-refund race was exercised here.

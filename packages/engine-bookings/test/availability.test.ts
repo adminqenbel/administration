@@ -12,7 +12,22 @@ import {
   type ResourceAvailabilityInputs,
 } from "../src/index.ts";
 import { intersectIntervals, normaliseIntervals } from "../src/availability-core.ts";
-import { at, atDate, connect, ctxFor, customerCtx, expectAppError, insert, MONDAY, seedSalon, tx, type Env } from "./helpers.ts";
+import {
+  addBreak,
+  addTimeOff,
+  allowServices,
+  at,
+  atDate,
+  connect,
+  ctxFor,
+  customerCtx,
+  expectAppError,
+  insert,
+  MONDAY,
+  seedSalon,
+  tx,
+  type Env,
+} from "./helpers.ts";
 
 let env: Env;
 before(async () => {
@@ -85,10 +100,8 @@ describe("slots from the real tables", () => {
     const s = await seedSalon(env, { resources: 1 });
     const ctx = ctxFor(s.tenantId);
     await tx(env, ctx, async (c) => {
-      await c.query("update resources set attributes = $2::jsonb where id = $1", [
-        s.resourceIds[0],
-        JSON.stringify({ breaks: [{ start: "13:00", end: "14:00" }], timeOff: [{ start: at(5 * 60), end: at(6 * 60) }] }),
-      ]);
+      await addBreak(c, s.tenantId, s.resourceIds[0] as string, "13:00", "14:00");
+      await addTimeOff(c, s.tenantId, s.resourceIds[0] as string, at(5 * 60), at(6 * 60));
       await insert(c, "holidays", { tenant_id: s.tenantId, location_id: s.locationId, holiday_date: "2031-01-07", name: "Closed" });
       await insert(c, "holidays", { tenant_id: s.tenantId, location_id: null, holiday_date: "2031-01-08", name: "Short day", closed: false, open_time: "12:00", close_time: "14:00" });
     });
@@ -106,13 +119,48 @@ describe("slots from the real tables", () => {
     assert.equal(wed.slots.length, 1, "special hours 12:00-14:00, minus the 13:00-14:00 break: only 12:00-13:00 is left");
   });
 
-  test("unreadable time-off data fails closed: the resource is not offered", async () => {
+  test("unreadable break or time-off rows fail closed: the resource is not offered", async () => {
+    const s = await seedSalon(env, { resources: 3 });
+    const ctx = ctxFor(s.tenantId);
+    const [a, b, ok] = s.resourceIds as [string, string, string];
+    await tx(env, ctx, async (c) => {
+      // seconds in a break cannot be shown as HH:MM without changing it: not understood, so not offered
+      await insert(c, "resource_breaks", { tenant_id: s.tenantId, resource_id: a, weekday: 1, start_time: "13:00:30", end_time: "14:00" });
+      // an open-ended time off (infinity) has no usable instant
+      await insert(c, "resource_time_off", { tenant_id: s.tenantId, resource_id: b, starts_at: at(-600), ends_at: "infinity" });
+    });
+    const r = await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s)));
+    assert.equal(r.resources.find((x) => x.resourceId === a)?.slots.length, 0);
+    assert.equal(r.resources.find((x) => x.resourceId === b)?.slots.length, 0);
+    assert.equal(r.resources.find((x) => x.resourceId === ok)?.slots.length, 37);
+  });
+
+  test("time off is half-open [start, end) and only the overlapping rows matter", async () => {
+    const s = await seedSalon(env, { resources: 1 });
+    const ctx = ctxFor(s.tenantId);
+    const r = s.resourceIds[0] as string;
+    await tx(env, ctx, async (c) => {
+      await addTimeOff(c, s.tenantId, r, at(120), at(180)); // 12:00-13:00
+      await addTimeOff(c, s.tenantId, r, at(-100000), at(-99000)); // long ago
+      await addTimeOff(c, s.tenantId, r, at(100000), at(101000)); // far away
+    });
+    const t = starts(await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s))));
+    assert.ok(t.includes(at(60)) && !t.includes(at(75)) && !t.includes(at(165)) && t.includes(at(180)), "11:00-12:00 ends as the time off starts; 13:00 starts as it ends");
+  });
+
+  test("resource_breaks are per weekday and replace the pack's breaks for that resource", async () => {
     const s = await seedSalon(env, { resources: 2 });
     const ctx = ctxFor(s.tenantId);
-    await tx(env, ctx, (c) => c.query("update resources set attributes = $2::jsonb where id = $1", [s.resourceIds[0], JSON.stringify({ timeOff: "next week" })]));
-    const r = await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s)));
-    assert.equal(r.resources.find((x) => x.resourceId === s.resourceIds[0])?.slots.length, 0);
-    assert.equal(r.resources.find((x) => x.resourceId === s.resourceIds[1])?.slots.length, 37);
+    const [withBreak, plain] = s.resourceIds as [string, string];
+    // Monday 13:00-14:00 only (weekday 1)
+    await tx(env, ctx, (c) => addBreak(c, s.tenantId, withBreak, "13:00", "14:00", [1]));
+    const mon = await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s)));
+    const slotsOf = (r: typeof mon, id: string) => r.resources.find((x) => x.resourceId === id)?.slots.map((x) => x.startsAt) ?? [];
+    assert.ok(!slotsOf(mon, withBreak).includes(at(195)), "13:15 runs into the break");
+    assert.ok(slotsOf(mon, plain).includes(at(195)), "the other resource has no break");
+    // Tuesday is a different weekday: no break row, so no break at all for this resource
+    const tue = await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s, { from: "2031-01-07" })));
+    assert.ok(slotsOf(tue, withBreak).includes(at(24 * 60 + 195)), "Tuesday has no break row");
   });
 
   test("falls back to the pack's hours when the location has none configured", async () => {
@@ -170,7 +218,7 @@ describe("eligibility", () => {
     const s = await seedSalon(env, { resources: 2 });
     const ctx = ctxFor(s.tenantId);
     const other = await tx(env, ctx, (c) => insert(c, "catalogue_items", { tenant_id: s.tenantId, kind: "service", name: "Colour", base_price_paise: 90000, duration_minutes: 120 }));
-    await tx(env, ctx, (c) => c.query("update resources set attributes = $2::jsonb where id = $1", [s.resourceIds[0], JSON.stringify({ serviceIds: [other] })]));
+    await tx(env, ctx, (c) => allowServices(c, s.tenantId, s.resourceIds[0] as string, [other]));
     const haircut = await tx(env, ctx, (c) => checkAvailability(c, ctx, query(s)));
     assert.deepEqual(haircut.resources.map((r) => r.resourceId), [s.resourceIds[1]]);
     const colour = await tx(env, ctx, (c) => checkAvailability(c, ctx, { from: MONDAY, catalogueItemId: other }));
@@ -336,6 +384,9 @@ describe("pure helpers", () => {
       allocations: [],
       unreadable: false,
     };
+    const withBreaks = { ...inputs, breaks: [{ weekday: 1, start: "10:30", end: "11:00" }] };
+    assert.equal(slotsForResource(withBreaks, [MONDAY], { durationMinutes: 30, bufferMinutes: 0, stepMinutes: 30, defaultHours: { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] }, defaultBreaks: [{ start: "11:00", end: "12:00" }] }).length, 3, "own breaks replace the default ones: 10:00, 11:00, 11:30");
+    assert.equal(slotsForResource({ ...withBreaks, breaks: [{ weekday: 2, start: "10:30", end: "11:00" }] }, [MONDAY], { durationMinutes: 30, bufferMinutes: 0, stepMinutes: 30, defaultHours: { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] }, defaultBreaks: [] }).length, 4, "a Tuesday break does not touch Monday");
     const defaults = { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] };
     assert.deepEqual(effectiveIntervals(inputs, MONDAY, defaults), [{ start: "10:00", end: "12:00" }]);
     const slots = slotsForResource(inputs, [MONDAY], { durationMinutes: 60, bufferMinutes: 0, stepMinutes: 30, defaultHours: defaults, defaultBreaks: [] });

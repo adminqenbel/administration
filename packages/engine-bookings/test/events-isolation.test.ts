@@ -113,7 +113,7 @@ describe("outbox events and audit", () => {
     assert.ok(!(await outboxTypes(env, s.tenantId)).some((t) => t.includes("check")));
   });
 
-  test("expiry is audited with the system actor and writes no webhook event", async () => {
+  test("expiry is audited with the system actor and queues one booking.expired event", async () => {
     const s = await seedSalon(env, { resources: 1 });
     const h = await book(env, s, { confirm: false });
     const job = ctxFor(s.tenantId, { kind: "system", actorId: "hold-expiry", now: new Date(Date.parse(h.holdExpiresAt as string) + 1000) });
@@ -121,7 +121,17 @@ describe("outbox events and audit", () => {
     const timeline = await tx(env, job, (c) => listBookingEvents(c, job, { bookingId: h.id }));
     assert.deepEqual(timeline.map((t) => t.action), ["booking.hold", "booking.expire"]);
     assert.equal(timeline[1]?.actorKind, "system");
-    assert.deepEqual(await outboxTypes(env, s.tenantId), ["booking.created"]);
+    assert.deepEqual(await outboxTypes(env, s.tenantId), ["booking.created", "booking.expired"]);
+    const [ev] = await rowsOf<{ aggregate_id: string; payload: Record<string, unknown> }>(env, s.tenantId, "select aggregate_id, payload from outbox_events where type = 'booking.expired'");
+    assert.equal(ev?.aggregate_id, h.id);
+    assert.equal(ev?.payload.status, "EXPIRED");
+    assert.equal(ev?.payload.previousStatus, "HOLD");
+    assert.equal(ev?.payload.version, h.version + 1);
+    assert.deepEqual(ev?.payload.actor, { kind: "system", id: "hold-expiry", channel: "dashboard" });
+    // A second run finds nothing: still exactly one event.
+    const again = await tx(env, job, (c) => expireHolds(c, job));
+    assert.equal(again.expired, 0);
+    assert.deepEqual(await outboxTypes(env, s.tenantId), ["booking.created", "booking.expired"]);
   });
 });
 

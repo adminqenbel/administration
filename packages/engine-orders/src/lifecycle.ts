@@ -8,6 +8,7 @@ import {
   OrderStatus,
   PaymentKind,
   PaymentMethod,
+  WebhookEvent,
   assertTransition,
   canTransition,
   type EngineContext,
@@ -18,6 +19,7 @@ import { insertLedgerEntry, refreshPaymentStatus } from "./ledger-db.ts";
 import { netPaidPaise } from "./ledger.ts";
 import { assertLinesStillOrderable, findOrCreateCustomer, missingCustomerFields, requireBooking, requireCustomer, type CustomerRow } from "./lookups.ts";
 import { loadPackContext, type PackContext } from "./pack.ts";
+import { actsForCustomer, assertOwnsOrder, requireStaff, subjectCustomerId } from "./scope.ts";
 import {
   cancelOrderInputSchema,
   placeOrderInputSchema,
@@ -55,11 +57,6 @@ function eventPayload(order: OrderRow, previous: OrderStatus, ctx: EngineContext
     occurredAt: ctx.now().toISOString(),
     ...extra,
   };
-}
-
-/** Throws unless the order belongs to the customer the channel layer verified. Never reveals that the order exists. */
-function assertOwner(order: OrderRow, onBehalfOfCustomerId: string | undefined): void {
-  if (onBehalfOfCustomerId !== undefined && order.customer_id !== onBehalfOfCustomerId) throw notFound("ORDER_NOT_FOUND");
 }
 
 /**
@@ -179,25 +176,30 @@ async function applyTransition(
 
   switch (to) {
     case OrderStatus.PLACED:
-      await emitEvent(sql, ctx, "order.created", { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
+      await emitEvent(sql, ctx, WebhookEvent.ORDER_CREATED, { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
       break;
     case OrderStatus.ACCEPTED:
-      await emitEvent(sql, ctx, "order.accepted", { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
+      await emitEvent(sql, ctx, WebhookEvent.ORDER_ACCEPTED, { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
       break;
     case OrderStatus.FULFILLED:
-      await emitEvent(sql, ctx, "order.fulfilled", { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
+      await emitEvent(sql, ctx, WebhookEvent.ORDER_FULFILLED, { aggregateType: "order", aggregateId: order.id, payload: eventPayload(updated, previous, ctx) });
       break;
     case OrderStatus.CANCELLED:
-    case OrderStatus.REJECTED:
-      // The webhook vocabulary has no order.rejected; payload.status says which it was. A draft was never announced
-      // (order.created is sent at placement), so cancelling one sends nothing.
+      // A draft was never announced (order.created is sent at placement), so cancelling one sends nothing.
       if (previous !== OrderStatus.DRAFT) {
-        await emitEvent(sql, ctx, "order.cancelled", {
+        await emitEvent(sql, ctx, WebhookEvent.ORDER_CANCELLED, {
           aggregateType: "order",
           aggregateId: order.id,
           payload: eventPayload(updated, previous, ctx, { reason: opts.reason ?? null }),
         });
       }
+      break;
+    case OrderStatus.REJECTED:
+      await emitEvent(sql, ctx, WebhookEvent.ORDER_REJECTED, {
+        aggregateType: "order",
+        aggregateId: order.id,
+        payload: eventPayload(updated, previous, ctx, { reason: opts.reason ?? null }),
+      });
       break;
     default:
       break;
@@ -231,14 +233,15 @@ async function run(
   orderId: string,
   expectedVersion: number | undefined,
   to: OrderStatus,
-  opts: TransitionOptions & { onBehalfOfCustomerId?: string | undefined } = {},
+  opts: TransitionOptions & { staffOnly?: boolean; operation: string },
 ): Promise<OrderView> {
+  if (opts.staffOnly) requireStaff(ctx, opts.operation);
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, true);
   try {
     // Lock first so concurrent callers queue; ownership is checked before the version so a foreign order looks absent.
     const order = await lockOrder(sql, ctx, orderId, undefined);
-    assertOwner(order, opts.onBehalfOfCustomerId);
+    assertOwnsOrder(ctx, order);
     if (expectedVersion !== undefined && order.version !== expectedVersion) {
       throw new AppError(ErrorCode.VERSION_CONFLICT, undefined, {
         reason: "ORDER_VERSION_CONFLICT",
@@ -258,6 +261,8 @@ async function run(
  * DRAFT -> PLACED. Needs at least one line, every line still orderable, and the pack's required customer fields on
  * the customer (existing `customerId`, an inline `customer` that is found by phone/email or created, or the order's
  * own customer). Totals are frozen from here on. Queues `order.created`.
+ * On a customer channel the order must belong to `ctx.subject.customerId` (else NOT_FOUND) and the customer cannot be
+ * changed or created from the call.
  */
 export async function placeOrder(sql: SqlClient, ctx: EngineContext, rawInput: PlaceOrderInput): Promise<OrderView> {
   const input = parseInput(placeOrderInputSchema, rawInput);
@@ -265,7 +270,7 @@ export async function placeOrder(sql: SqlClient, ctx: EngineContext, rawInput: P
   const packCtx = await loadPackContext(sql, ctx, true);
   try {
     const order = await lockOrder(sql, ctx, input.orderId, undefined);
-    assertOwner(order, input.onBehalfOfCustomerId);
+    assertOwnsOrder(ctx, order);
     if (input.expectedVersion !== undefined && order.version !== input.expectedVersion) {
       throw new AppError(ErrorCode.VERSION_CONFLICT, undefined, {
         reason: "ORDER_VERSION_CONFLICT",
@@ -274,7 +279,7 @@ export async function placeOrder(sql: SqlClient, ctx: EngineContext, rawInput: P
       });
     }
     assertTransition(packCtx.machine, order.status, OrderStatus.PLACED, "order");
-    if (input.onBehalfOfCustomerId !== undefined && (input.customer !== undefined || (input.customerId !== undefined && input.customerId !== input.onBehalfOfCustomerId))) {
+    if (actsForCustomer(ctx) && (input.customer !== undefined || (input.customerId !== undefined && input.customerId !== subjectCustomerId(ctx)))) {
       throw orderError(ErrorCode.VALIDATION_FAILED, "CUSTOMER_CHANGE_NOT_ALLOWED", "The customer on this order cannot be changed.");
     }
     let customer: CustomerRow | null = null;
@@ -287,45 +292,52 @@ export async function placeOrder(sql: SqlClient, ctx: EngineContext, rawInput: P
   }
 }
 
-export const acceptOrder = (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
+export const acceptOrder = async (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
   const input = parseInput(stepOrderInputSchema, raw);
-  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.ACCEPTED);
+  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.ACCEPTED, { staffOnly: true, operation: "acceptOrder" });
 };
 
-export const startProcessing = (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
+export const startProcessing = async (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
   const input = parseInput(stepOrderInputSchema, raw);
-  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.PROCESSING);
+  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.PROCESSING, { staffOnly: true, operation: "startProcessing" });
 };
 
-export const markReady = (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
+export const markReady = async (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
   const input = parseInput(stepOrderInputSchema, raw);
-  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.READY);
+  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.READY, { staffOnly: true, operation: "markReady" });
 };
 
-export const fulfil = (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
+export const fulfil = async (sql: SqlClient, ctx: EngineContext, raw: StepOrderInput): Promise<OrderView> => {
   const input = parseInput(stepOrderInputSchema, raw);
-  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.FULFILLED);
+  return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.FULFILLED, { staffOnly: true, operation: "fulfil" });
 };
 
-/** PLACED -> REJECTED (staff declines). A paid order also gets a refund ledger entry. Queues order.cancelled (status REJECTED). */
-export const rejectOrder = (sql: SqlClient, ctx: EngineContext, raw: RejectOrderInput): Promise<OrderView> => {
+/** PLACED -> REJECTED (staff declines). A paid order also gets a refund ledger entry. Queues order.rejected. */
+export const rejectOrder = async (sql: SqlClient, ctx: EngineContext, raw: RejectOrderInput): Promise<OrderView> => {
   const input = parseInput(rejectOrderInputSchema, raw);
   return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.REJECTED, {
     reason: input.reason,
     refundMethod: input.refundMethod,
+    staffOnly: true,
+    operation: "rejectOrder",
   });
 };
 
 /**
  * DRAFT | PLACED | ACCEPTED -> CANCELLED (as far as the pack allows). A paid order becomes CANCELLED plus a refund
- * entry for everything it holds. `onBehalfOfCustomerId` makes a foreign order look absent.
+ * entry for everything it holds. On a customer channel only the verified subject's own order can be cancelled; any
+ * other order looks absent (NOT_FOUND).
  */
-export const cancelOrder = (sql: SqlClient, ctx: EngineContext, raw: CancelOrderInput): Promise<OrderView> => {
+export const cancelOrder = async (sql: SqlClient, ctx: EngineContext, raw: CancelOrderInput): Promise<OrderView> => {
   const input = parseInput(cancelOrderInputSchema, raw);
+  // A customer does not choose how a refund is recorded.
+  if (actsForCustomer(ctx) && input.refundMethod !== undefined) {
+    throw orderError(ErrorCode.VALIDATION_FAILED, "REFUND_METHOD_NOT_ALLOWED", "The refund method is chosen by the business.");
+  }
   return run(sql, ctx, input.orderId, input.expectedVersion, OrderStatus.CANCELLED, {
     reason: input.reason,
     refundMethod: input.refundMethod,
-    onBehalfOfCustomerId: input.onBehalfOfCustomerId,
+    operation: "cancelOrder",
   });
 };
 
@@ -335,8 +347,14 @@ export const cancelOrder = (sql: SqlClient, ctx: EngineContext, raw: CancelOrder
  */
 export async function transitionOrder(sql: SqlClient, ctx: EngineContext, raw: TransitionOrderInput): Promise<OrderView> {
   const input = parseInput(transitionOrderInputSchema, raw);
+  requireStaff(ctx, "transitionOrder");
   if (input.to === OrderStatus.PLACED) {
     return placeOrder(sql, ctx, { orderId: input.orderId, expectedVersion: input.expectedVersion });
   }
-  return run(sql, ctx, input.orderId, input.expectedVersion, input.to, { reason: input.reason, refundMethod: input.refundMethod });
+  return run(sql, ctx, input.orderId, input.expectedVersion, input.to, {
+    reason: input.reason,
+    refundMethod: input.refundMethod,
+    staffOnly: true,
+    operation: "transitionOrder",
+  });
 }

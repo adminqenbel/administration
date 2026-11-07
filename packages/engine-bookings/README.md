@@ -30,7 +30,7 @@ The first thing each function does is check that the connection's `app.tenant_id
 
 ## How double booking is prevented
 
-The database decides. `createHold` locks the resource rows in id order, checks hours, then inserts the booking and allocation rows in id order. The exclusion constraint (exclusive resources) or the capacity trigger (shared resources) raises SQLSTATE `23P01`, which becomes `BOOKING_SLOT_TAKEN`. Each attempt runs in a savepoint, so a failed attempt leaves nothing behind even if the caller commits. With no resource named, the engine tries eligible resources in name order and takes the first that is free.
+The database decides. `createHold` locks the resource rows in id order, expires due holds on them, checks hours, then inserts the booking and allocation rows in id order. The exclusion constraint (exclusive resources) or the capacity trigger (shared resources) raises SQLSTATE `23P01`, which becomes `BOOKING_SLOT_TAKEN`. Each attempt runs in a savepoint, so a failed attempt leaves nothing behind even if the caller commits. With no resource named, the engine tries eligible resources in name order and takes the first that is free.
 
 An exclusive resource is occupied through its cleanup buffer: the allocation period is `[startsAt, endsAt + buffer)`, so the database enforces the buffer for every caller. `bookings.ends_at` is the service end only. Buffer is the larger of the service's `buffer_minutes` and the pack default. A shared resource is occupied for the service time only, with `units = partySize` (default 1).
 
@@ -42,9 +42,20 @@ Transitions go through `assertTransition` on the pack's machine (`machineForPack
 
 A hold or reschedule must lie inside opening hours (location hours, intersected with the resource's own schedule, holiday closures or special hours, breaks, time off). It uses the same `generateSlots` code as availability. Failures are `BOOKING_SLOT_TAKEN` with `details.reason`: `taken`, `no_resource`, `outside_hours`, `in_the_past`, `lead_time`, `too_far_ahead`. Lead time and maximum advance apply to customer channels only (any channel except `dashboard`). The past is refused for everyone.
 
+## Lock order
+
+Every multi-statement flow takes locks in the order the database uses in the allocation insert trigger and both hold sweeps (migration 016): **resource rows (ascending id) -> booking rows (ascending id) -> booking_allocations**.
+
+- `createHold`: `lockResources`, then `expireDueHolds` (locks the due HOLD bookings in id order, expires them), then the new booking and allocations (id order).
+- `expireHolds`: locks the resources of the due holds, then the due bookings, then updates; the status change releases the allocations through `bookings_sync_allocations`.
+- `rescheduleBooking`: reads the booking's allocations without a lock, locks the old and new resources, only then locks the booking, and re-reads the allocations. If they changed in between it throws `VERSION_CONFLICT` (`details.reason: allocation_changed`, nothing written; retry).
+- `confirmBooking`, `cancelBooking`, check-in/complete/no-show: lock the booking, then the status/`expires_at` change reaches the allocations through the sync trigger. They never lock a resource afterwards (releasing an allocation does not take the resource lock), so they cannot invert the order.
+
+`test/hold-locks.test.ts` races `expireHolds`, `createHold`, `confirmBooking`, `cancelBooking` and `rescheduleBooking` on one resource and fails on any `SERVICE_UNAVAILABLE` (the mapping of 40P01/40001). The engine still maps those codes to a retry.
+
 ## Hold expiry
 
-`hold_expires_at` is `ctx.now() + holdMinutes` (tenant setting, else pack). Three layers: the insert trigger releases an expired hold that blocks a new booking; `expireHolds` calls `expire_booking_holds_for_current_tenant` and audits each hold; the cross-tenant job uses `expireBookingHolds` from `@qenbel/db`. Confirm past expiry throws `HOLD_EXPIRED`; the throw rolls the transaction back, so the row itself is marked `EXPIRED` by the sweep, not by confirm.
+`hold_expires_at` is `ctx.now() + holdMinutes` (tenant setting, else pack). Three layers: `createHold` and `rescheduleBooking` expire due holds on the resources they lock (so the allocation trigger finds nothing left to release); `expireHolds` expires every due hold of the tenant and then calls `expire_booking_holds_for_current_tenant` for stray allocations; the cross-tenant job `expireBookingHolds` from `@qenbel/db` exists but writes no audit or outbox rows, so a worker that wants `booking.expired` events should call `expireHolds` per tenant. Each hold the engine expires gets one `audit_log` row (`booking.expire`) and one `booking.expired` outbox event, in the same transaction, exactly once (the HOLD to EXPIRED update only matches a row still in HOLD, under its row lock). Payload: the usual booking payload with `status: EXPIRED`, `previousStatus: HOLD` and `reason` (`hold_expired` from the sweep, `slot_requested` when a new hold or reschedule cleared it). Expiry is judged by `ctx.now()` in `expireHolds` and by the database clock in `createHold`/`rescheduleBooking` (the same clock the trigger uses). Confirm past expiry throws `HOLD_EXPIRED`; the throw rolls the transaction back, so the row itself is marked `EXPIRED` by the sweep, not by confirm.
 
 ## Cancellation policy
 
@@ -61,14 +72,20 @@ Reschedule inside the window: `block` refuses customer channels; otherwise it is
 
 All optional, strict, invalid values give `PACK_INVALID`: `holdMinutes`, `leadTimeMinutes` (default 0), `maxAdvanceDays` (default 90), `stepMinutes`, `breaks[]`, `cancellationPolicy { cancelUntilHoursBefore, lateCancellation, lateFeePaise, forfeitDepositOnLate }`, `deposit { percentBps | fixedPaise }`. A service can set `catalogue_items.attributes.depositPaise`.
 
-## Data the schema does not model yet
+## Resource availability data
 
-No tables exist for staff time off, daily breaks or which services a resource can do. Until the db agent adds them (see `docs/CONTRACT-REQUESTS.md`), `src/sql-source.ts` reads `resources.attributes`: `serviceIds`, `breaks`, `timeOff`. Unreadable values make the resource unavailable (fail closed). If a location has no `business_hours` rows, the pack's default hours apply.
+`src/sql-source.ts` reads the tables from migration 013 (the old `resources.attributes.{timeOff,breaks,serviceIds}` keys are not read or written):
+
+- `resource_time_off(resource_id, starts_at, ends_at)`: blocked `[starts_at, ends_at)`; only rows overlapping the requested window are loaded.
+- `resource_breaks(resource_id, weekday 0=Sunday..6, start_time, end_time)`: recurring breaks in the location's time zone. A resource with no rows uses the tenant/pack `breaks`; a resource with any row uses only its own rows, per weekday (a weekday without a row has no break).
+- `resource_services(resource_id, catalogue_item_id)`: a resource with no rows can serve any service (of the matching `required_resource_type`); rows narrow it to exactly those services (`details.reason: service` / `resource_not_eligible`).
+
+Rows that cannot be understood (a break with seconds, an open-ended `infinity` time off) make the resource unavailable (fail closed). If a location has no `business_hours` rows, the pack's default hours apply.
 
 ## Idempotency, events, audit
 
 - With `ctx.idempotencyKey`, write functions use `idempotency_keys` (route `engine-bookings:<function>`) in the same transaction. Same key and input returns the stored result with `replayed: true` and writes nothing; different input is `IDEMPOTENCY_CONFLICT`. A call that fails leaves no key, so it can be retried.
-- Outbox rows (`booking.created` on hold, `.confirmed`, `.rescheduled`, `.cancelled`, `.no_show`, `.completed`, and `customer.created` when confirm creates a customer) are written on the caller's transaction: once, and only on commit. Payloads carry ids, times and status, no free text.
+- Outbox rows (`booking.created` when the HOLD is created (not at confirm, so a hold that expires has created and expired events but no confirmed one), `.confirmed`, `.rescheduled`, `.cancelled`, `.no_show`, `.completed`, `.expired` (once per expired hold), and `customer.created` when confirm creates a customer) are written on the caller's transaction: once, and only on commit. Payloads carry ids, times and status, no free text.
 - Every change writes an `audit_log` row (`booking.hold`, `.confirm`, `.reschedule`, `.cancel`, `.check_in`, `.complete`, `.no_show`, `.expire`) with actor kind, actor id and channel. `listBookingEvents` reads them back.
 
 ## Tests

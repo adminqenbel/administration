@@ -13,7 +13,7 @@ before(async () => {
   fx = await restaurantFixture(db);
   // 12 orders, created one after another so created_at is strictly increasing.
   for (let i = 0; i < 12; i++) {
-    const channel = i % 3 === 0 ? "whatsapp" : "dashboard";
+    const channel = i % 3 === 0 ? "api" : "dashboard";
     const customerId = i % 2 === 0 ? fx.customerId : fx.otherCustomerId;
     made.push(await call((s) => createOrderDraft(s, ctxFor(fx.tenantId, { channel }), { items: [{ catalogueItemId: fx.tikka, quantity: 1 + i }], customerId })));
   }
@@ -72,8 +72,8 @@ describe("listOrders", () => {
     assert.deepEqual(byStatus.items.map((i) => i.id).sort(), [made[4], made[5], made[6], made[11]].map((o) => o!.id).sort());
     const byCustomer = await call((s) => listOrders(s, ctx(), { customerId: fx.otherCustomerId, status: "DRAFT", limit: 100 }));
     assert.deepEqual(byCustomer.items.map((i) => i.id).sort(), [made[1], made[3]].map((o) => o!.id).sort());
-    const byChannel = await call((s) => listOrders(s, ctx(), { channel: "whatsapp", limit: 100 }));
-    assert.ok(byChannel.items.length >= 4 && byChannel.items.every((i) => i.source === "whatsapp"));
+    const byChannel = await call((s) => listOrders(s, ctx(), { channel: "api", limit: 100 }));
+    assert.ok(byChannel.items.length >= 4 && byChannel.items.every((i) => i.source === "api"));
     const unpaidPlaced = await call((s) => listOrders(s, ctx(), { status: "PLACED", paymentStatus: "unpaid", limit: 100 }));
     assert.equal(unpaidPlaced.items.length, 3);
     const byRef = await call((s) => listOrders(s, ctx(), { reference: made[3]!.reference.toLowerCase() }));

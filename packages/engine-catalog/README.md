@@ -29,7 +29,7 @@ Rules every function follows:
 | CRM | `addCustomerNote`, `listCustomerNotes`, `createFollowUp`, `getFollowUp`, `updateFollowUp`, `setFollowUpStatus`, `listFollowUps`, `logCommunication`, `listCommunications`, `getCustomerTimeline`, `getCustomerBalance` |
 | Catalogue | `createCatalogueItem`, `updateCatalogueItem`, `archiveCatalogueItem`, `restoreCatalogueItem`, `getCatalogueItem`, `listCatalogueItems`, `createVariant`, `updateVariant`, `listVariants`, `createCategory`, `updateCategory`, `listCategories`, `deleteCategory`, `getCatalogueForChannel` (AI-safe) |
 | Business | `getBusinessProfile`, `getBusinessProfileForChannel` (AI-safe), `updateBusinessProfile`, `createLocation`, `updateLocation`, `getLocation`, `listLocations`, `archiveLocation`, `restoreLocation`, `getLocationHours`, `setLocationHours`, `createHoliday`, `updateHoliday`, `deleteHoliday`, `listHolidays` |
-| Resources | `createResource`, `updateResource`, `getResource`, `listResources`, `archiveResource`, `restoreResource`, `getResourceSchedule`, `setResourceSchedule`, `setResourceBreaks`, `getResourceBreaks`, `addResourceTimeOff`, `removeResourceTimeOff`, `listResourceTimeOff`, `setResourceServices`, `listResourcesForService` |
+| Resources | `createResource`, `updateResource`, `getResource`, `listResources`, `archiveResource`, `restoreResource`, `getResourceSchedule`, `setResourceSchedule`, `setResourceBreaks`, `getResourceBreaks`, `addResourceTimeOff`, `removeResourceTimeOff`, `listResourceTimeOff`, `setResourceServices`, `listResourcesForService` (`loadWeeklyBreaks` is an internal set-based reader) |
 | Availability | `loadAvailabilityInputs` plus pure helpers `slotRequestFor`, `generateResourceSlots`, `generateAllSlots`, `peakUnits`, `intersectIntervals` |
 | Pure helpers | `normalisePhone`, `normaliseEmail`, `maskPhone`, `maskEmail`, `breaksOf` |
 
@@ -39,7 +39,14 @@ Rules every function follows:
   returns `{ customer, created: false, matchedBy }` without writing. If the phone matches one customer and the email another it
   throws `CONFLICT` with `details.candidates`. Concurrent creates are serialised with advisory locks. Archived customers are
   not matched; restoring one whose phone or email is now taken is `CONFLICT`. `updateCustomer` onto someone else's phone or
-  email is `CONFLICT` naming that customer.
+  email is `CONFLICT` naming that customer (`details.field`, `customerId`, `candidates`).
+- **Database backstop (migration 014).** The database also enforces one active customer per tenant per phone and per
+  `lower(email)` (`customers_active_phone_unique`, `customers_active_email_unique`, SQLSTATE 23505). The engine keeps its
+  lookup and advisory locks, so the constraint only fires when some other writer (without the locks) wins a race. Each
+  write that can hit it runs in a savepoint, so the transaction stays usable: `createCustomer` then re-reads and answers as
+  a dedupe (`created: false`, the winner), or `CONFLICT` with `details.candidates` if that is ambiguous; `updateCustomer`
+  and `restoreCustomer` throw `CONFLICT` with `details.field` (`phone` | `email`), `customerId` and `candidates`. Any other
+  engine call that meets those two constraints maps to `CONFLICT` with `details.field` and no database text.
 - **Phone.** `normalisePhone` accepts `+`/`00` international numbers and, for India, bare 10 digit mobiles (6-9), with `0` or `91`
   in front. Anything it cannot place safely is refused, not guessed.
 - **AI-safe reads.** `searchCustomersForAi`: id, first name, masked phone and email, `hasUpcomingBooking`, at most 5, needs a filter.
@@ -50,18 +57,22 @@ Rules every function follows:
   resource or location with upcoming bookings is `CONFLICT` with the count (R6.4). Archive is idempotent.
 - **R6.5.** `addResourceTimeOff` and a shorter `setResourceSchedule` are refused with `details.affectedBookings` when live
   bookings or holds would be hit. An all-empty schedule removes it (the resource then follows the location's hours).
-- **Breaks.** A break in the location's or a resource's weekly hours is the gap between two intervals on a day. Daily breaks
-  for one resource (the same every day) are `setResourceBreaks`.
-
-### Interim storage (needs a db migration, see docs/CONTRACT-REQUESTS.md)
-
-Migration 005 has no table for resource time off, daily breaks, or resource-to-service links. They are stored in
-`resources.attributes` under the reserved keys `timeOff`, `breaks`, `serviceIds`, written under a row lock and only through
-`src/resources.ts`. Callers cannot set those keys through `attributes`. Moving to real tables changes that file and the
-`ELIGIBLE_SQL` predicate only; the function signatures stay.
-
-Eligibility rule: a resource with explicit `serviceIds` serves exactly those services. A resource with none serves services
-whose `required_resource_type` is unset or equal to the resource type. Set `requiredResourceType` on services in packs.
+- **Breaks.** A break in the location's weekly hours is the gap between two intervals on a day. A resource's own breaks are
+  rows in `resource_breaks` (`weekday` 0 = Sunday, local time, one row per weekday). `setResourceBreaks({ resourceId, breaks })`
+  is the daily form (the same on every day: a break writes seven rows); `setResourceBreaks({ resourceId, weekly })` sets a
+  pattern per weekday. Both replace the whole set; an empty list removes it. `getResourceBreaks` returns `breaks` (those
+  that apply on all seven days), `weekly` and `hasBreaks` (the resource has rows).
+- **Time off.** Rows in `resource_time_off`, half-open `[startsAt, endsAt)`: an entry overlaps a window when
+  `starts_at < windowEnd and ends_at > windowStart`, so touching edges do not overlap. Entries may overlap each other; an
+  exact duplicate is `CONFLICT`. `reason` up to 500 characters. `createdByUserId` is filled only when the actor is a user
+  of this tenant. At most 500 per resource.
+- **Service links.** Rows in `resource_services`. A resource with rows serves exactly those services; a resource without
+  rows serves services whose `required_resource_type` is unset or equal to the resource type (`ELIGIBLE_SQL`).
+- **`attributes` is just a bag.** `resources.attributes` holds scalar keys only (string, number, boolean). `timeOff`,
+  `breaks` and `serviceIds` used to be reserved for interim storage; they are now ordinary keys with no meaning to the
+  engine (a string under `timeOff` changes nothing), and the array/object values the old storage used are refused like any
+  non-scalar value. The engine never reads or writes them. Rows an older version of the engine left in those keys were
+  moved by migration 013 (`app_move_resource_extras()`).
 
 ## `loadAvailabilityInputs`
 
@@ -77,7 +88,9 @@ loadAvailabilityInputs(sql, ctx, {
 }) => AvailabilityInputs
 ```
 
-Needs `serviceId`, or `durationMinutes`; not both. Constant number of queries (about 8) however many resources there are.
+Needs `serviceId`, or `durationMinutes`; not both. A constant number of queries (9 with a service, none per resource: location,
+service, resources, location hours, holidays, schedules, breaks, time off, allocations) however many resources there are; a test
+asserts the count is the same for 2 and 27 resources.
 
 ```ts
 interface AvailabilityInputs {
@@ -92,9 +105,10 @@ interface AvailabilityInputs {
     hours: WeeklyHours;                    // shared WeeklyHours: location hours intersected with the resource schedule
     dateOverrides: Record<string, TimeInterval[]>; // local date -> that day's intervals, where it differs from `hours`
                                                    // (special-hours holidays, dated schedule rows)
-    breaks: TimeInterval[];                // the resource's daily breaks
+    breaks: Record<Weekday, TimeInterval[]>; // the resource's own breaks per local weekday (resource_breaks)
+    hasOwnBreaks: boolean;                 // true when the resource has break rows (false: use your default breaks)
     holidays: string[];                    // closed local dates (location holiday or all-location holiday)
-    timeOff: TimeRange[];                  // UTC ranges overlapping the window
+    timeOff: TimeRange[];                  // resource_time_off overlapping the window, UTC
     allocations: Array<{ start: string; end: string; units: number }>; // active, unexpired; ISO UTC
   }>;
 }
@@ -104,8 +118,8 @@ interface AvailabilityInputs {
 service, in `resourceIds`, big enough for `partySize`. Expired holds and cancelled bookings are not in `allocations`.
 Allocations within the service buffer of the window edges are included.
 
-The raw fields are exactly what `generateSlots` takes (`hours`, `breaks`, `holidays`, `allocations`, `durationMinutes`,
-`bufferMinutes`). Three things `generateSlots` does not know are handled by the helpers, so use them rather than calling it directly:
+The raw fields are what `generateSlots` takes (`hours`, `holidays`, `allocations`, `durationMinutes`, `bufferMinutes`); `breaks`
+is per weekday here and `slotRequestFor` passes the date's weekday list as `generateSlots`' daily `breaks`. Three things `generateSlots` does not know are handled by the helpers, so use them rather than calling it directly:
 
 1. **Time off** is subtracted after generation.
 2. **Date overrides** (special-hours holidays, dated schedule rows) replace that weekday's intervals for one date.

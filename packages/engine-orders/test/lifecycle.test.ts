@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, it } from "node:test";
-import { DEFAULT_ORDER_TRANSITIONS, OrderStatus, orderMachine, canTransition, type ConfigPack } from "@qenbel/shared";
+import { DEFAULT_ORDER_TRANSITIONS, OrderStatus, WebhookEvent, orderMachine, canTransition, type ConfigPack } from "@qenbel/shared";
 import { getPack as registryPack } from "@qenbel/config-packs";
 import { withTenant } from "@qenbel/db";
 import {
@@ -376,29 +376,19 @@ describe("placeOrder rules", () => {
     assert.equal(placed.totalPaise, o.totalPaise);
     assert.equal(placed.taxPaise, o.taxPaise);
   });
-
-  it("onBehalfOfCustomerId: a customer-facing call cannot place or cancel someone else's order, and cannot swap the customer", async () => {
-    const o = await newDraft(fx.customerId);
-    await rejectsWith(() => call((s) => placeOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.otherCustomerId })), "NOT_FOUND", "ORDER_NOT_FOUND");
-    await rejectsWith(() => call((s) => cancelOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.otherCustomerId })), "NOT_FOUND", "ORDER_NOT_FOUND");
-    await rejectsWith(() => call((s) => placeOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.customerId, customerId: fx.otherCustomerId })), "VALIDATION_FAILED", "CUSTOMER_CHANGE_NOT_ALLOWED");
-    await rejectsWith(() => call((s) => placeOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.customerId, customer: { name: "Mallory", phone: "+919800000000" } })), "VALIDATION_FAILED", "CUSTOMER_CHANGE_NOT_ALLOWED");
-    const placed = await call((s) => placeOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.customerId }));
-    assert.equal(placed.status, "PLACED");
-    const cancelled = await call((s) => cancelOrder(s, ctx({ channel: "whatsapp" }), { orderId: o.id, onBehalfOfCustomerId: fx.customerId, reason: "changed my mind" }));
-    assert.equal(cancelled.status, "CANCELLED");
-  });
 });
 
 describe("reject and cancel", () => {
-  it("rejecting a placed order records the reason; the event says REJECTED", async () => {
+  it("rejecting a placed order records the reason and queues order.rejected (not order.cancelled)", async () => {
     const o = await place(await newDraft());
     const r = await call((s) => rejectOrder(s, ctx(), { orderId: o.id, expectedVersion: o.version, reason: "kitchen closed" }));
     assert.equal(r.status, "REJECTED");
     assert.equal(r.statusLabel, "Declined");
     assert.equal(r.cancellationReason, "kitchen closed");
-    const last = (await events(o.id)).at(-1)!;
-    assert.equal(last.type, "order.cancelled");
+    const all = await events(o.id);
+    assert.deepEqual(all.map((e) => e.type), ["order.created", "order.rejected"]);
+    const last = all.at(-1)!;
+    assert.equal(last.type, WebhookEvent.ORDER_REJECTED);
     assert.equal(last.payload.status, "REJECTED");
     assert.equal(last.payload.previousStatus, "PLACED");
     assert.equal(last.payload.reason, "kitchen closed");
@@ -432,9 +422,18 @@ describe("reject and cancel", () => {
     const rows = await call((s) => s.query("select kind, method, amount_paise::int as amount, status from payments where order_id = $1 order by created_at, id", [p.id]));
     assert.deepEqual(rows.rows.map((r) => [r.kind, r.method, r.amount, r.status]), [["payment", "upi", 5000, "completed"], ["payment", "cash", 3000, "completed"], ["refund", "upi", 8000, "completed"]]);
     const ev = (await events(p.id)).map((e) => e.type).sort();
-    assert.deepEqual(ev, ["order.cancelled", "order.created", "payment.completed", "payment.completed", "payment.completed"]);
-    const refundEvent = (await events(p.id)).find((e) => e.type === "payment.completed" && e.payload.kind === "refund");
+    assert.deepEqual(ev, ["order.cancelled", "order.created", "payment.completed", "payment.completed", "payment.refunded"]);
+    const refundEvent = (await events(p.id)).find((e) => e.type === WebhookEvent.PAYMENT_REFUNDED);
     assert.equal(refundEvent?.payload.amountPaise, 8000);
+    assert.equal(refundEvent?.payload.kind, "refund");
+  });
+
+  it("rejecting a paid order queues order.rejected and payment.refunded, once each, and no order.cancelled", async () => {
+    const p = await place(await newDraft());
+    await call((s) => recordPayment(s, ctx(), { orderId: p.id, amountPaise: 2500, method: "cash" }));
+    await call((s) => rejectOrder(s, ctx(), { orderId: p.id, expectedVersion: p.version, reason: "out of stock" }));
+    const types = (await events(p.id)).map((e) => e.type).sort();
+    assert.deepEqual(types, ["order.created", "order.rejected", "payment.completed", "payment.refunded"]);
   });
 });
 
@@ -457,6 +456,27 @@ describe("outbox: once, and only on commit", () => {
     // and the same call afterwards works once
     await step(acceptOrder, o);
     assert.equal((await events(o.id)).filter((e) => e.type === "order.accepted").length, 1);
+  });
+
+  it("order.rejected and payment.refunded are queued once and only when the transaction commits", async () => {
+    const p = await place(await newDraft());
+    await call((s) => recordPayment(s, ctx(), { orderId: p.id, amountPaise: 1000, method: "cash" }));
+    const before = (await events(p.id)).length;
+    await assert.rejects(
+      withTenant(db.app, fx.tenantId, async (s) => {
+        const r = await rejectOrder(s, ctx(), { orderId: p.id, expectedVersion: p.version, reason: "nope" });
+        assert.equal(r.status, "REJECTED");
+        throw new Error("boom after reject");
+      }),
+      /boom/,
+    );
+    assert.equal((await events(p.id)).length, before, "rolled back: no order.rejected, no payment.refunded");
+    assert.equal((await call((s) => getOrder(s, ctx(), { orderId: p.id }))).status, "PLACED");
+    await call((s) => rejectOrder(s, ctx(), { orderId: p.id, expectedVersion: p.version, reason: "nope" }));
+    const after = await events(p.id);
+    assert.equal(after.filter((e) => e.type === "order.rejected").length, 1);
+    assert.equal(after.filter((e) => e.type === "payment.refunded").length, 1);
+    assert.equal(after.filter((e) => e.type === "order.cancelled").length, 0);
   });
 
   it("a placement that fails on required fields leaves no customer and no customer.created event", async () => {

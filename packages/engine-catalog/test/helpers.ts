@@ -44,8 +44,22 @@ export async function connectTestDb(): Promise<TestDb> {
     owner,
     async createTenant(prefix) {
       const slug = `${prefix}-${randomUUID().slice(0, 8)}`.toLowerCase();
-      const res = await app.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Test ${slug}`]);
-      const id = (res.rows[0] as { id: string }).id;
+      // Since migration 017 the runtime role cannot call platform_create_tenant (only the platform ops role can). The suite
+      // has no ops login, so the owner role steps into qenbel_platform for this one statement, as the migrations do.
+      const client = await owner.connect();
+      let id: string;
+      try {
+        await client.query("begin");
+        await client.query("set local role qenbel_platform");
+        const res = await client.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Test ${slug}`]);
+        await client.query("commit");
+        id = (res.rows[0] as { id: string }).id;
+      } catch (err) {
+        await client.query("rollback").catch(() => undefined);
+        throw err;
+      } finally {
+        client.release();
+      }
       tenants.push(id);
       return id;
     },
@@ -66,6 +80,7 @@ export async function connectTestDb(): Promise<TestDb> {
 const CLEANUP_ORDER = [
   "payments", "fulfilments", "order_items", "orders", "follow_up_tasks", "communications", "notifications", "booking_allocations",
   "bookings", "conversation_messages", "conversations", "customer_notes", "customer_tags", "customers", "resource_schedules",
+  "resource_time_off", "resource_breaks", "resource_services",
   "resources", "holidays", "business_hours", "catalogue_variants", "catalogue_items", "catalogue_categories", "outbox_events",
   "user_locations", "users", "locations",
 ];
@@ -82,6 +97,8 @@ export interface CtxOptions {
   channel?: Channel;
   actorId?: string;
   now?: Date;
+  /** The verified end customer (set by the channel layer in production). */
+  subject?: { customerId?: string; conversationId?: string };
 }
 
 export function makeCtx(tenantId: string, options: CtxOptions = {}): EngineContext {
@@ -90,6 +107,7 @@ export function makeCtx(tenantId: string, options: CtxOptions = {}): EngineConte
     actor: { kind: options.kind ?? PrincipalKind.SYSTEM, id: options.actorId ?? "test", channel: options.channel ?? Channel.DASHBOARD },
     now: () => options.now ?? NOW,
     newId: () => randomUUID(),
+    ...(options.subject ? { subject: options.subject } : {}),
   };
 }
 

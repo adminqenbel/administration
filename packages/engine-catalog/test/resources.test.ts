@@ -44,7 +44,7 @@ describe("create, read, update", () => {
     assert.equal((await call(db, ctx, getResource, { resourceId: s.id })).name, "Asha");
   });
 
-  test("bad input: unknown type or mode, minUnits above capacity, reserved or non-plain attributes, smuggled keys", async () => {
+  test("bad input: unknown type or mode, minUnits above capacity, non-plain attributes, smuggled keys", async () => {
     const t = await db.createTenant("res-bad");
     const other = await db.createTenant("res-bad-o");
     const ctx = makeCtx(t);
@@ -52,8 +52,7 @@ describe("create, read, update", () => {
     await rejectsWith(call(db, ctx, createResource, { type: "room", name: "X", allocationMode: "chaotic" }), "VALIDATION_FAILED");
     await rejectsWith(call(db, ctx, createResource, { type: "table", name: "X", capacityUnits: 2, minUnits: 3 }), "VALIDATION_FAILED");
     await rejectsWith(call(db, ctx, createResource, { type: "table", name: "X", capacityUnits: 0 }), "VALIDATION_FAILED");
-    await rejectsWith(call(db, ctx, createResource, staff("X", { attributes: { timeOff: [] } }) as never), "VALIDATION_FAILED");
-    await rejectsWith(call(db, ctx, createResource, staff("X", { attributes: { serviceIds: "all" } }) as never), "VALIDATION_FAILED");
+    await rejectsWith(call(db, ctx, createResource, staff("X", { attributes: { timeOff: [] } }) as never), "VALIDATION_FAILED"); // arrays are not scalars
     await rejectsWith(call(db, ctx, createResource, staff("X", { attributes: { nested: { a: 1 } } }) as never), "VALIDATION_FAILED");
     await rejectsWith(call(db, ctx, createResource, staff("X", { tenantId: other }) as never), "VALIDATION_FAILED");
     await rejectsWith(call(db, ctx, createResource, staff("X", { locationId: ghost }) as never), "NOT_FOUND");

@@ -4,6 +4,9 @@ import { after, before, describe, test } from "node:test";
 import { AppError, ErrorCode } from "@qenbel/shared";
 import { checkAvailability, confirmBooking, createHold, expireHolds, getBooking } from "../src/index.ts";
 import {
+  addBreak,
+  addTimeOff,
+  allowServices,
   at,
   atDate,
   connect,
@@ -411,10 +414,8 @@ describe("hold rules", () => {
     const r = s.resourceIds[0] as string;
     const ctx = ctxFor(s.tenantId);
     await tx(env, ctx, async (c) => {
-      await c.query("update resources set attributes = $2::jsonb where id = $1", [
-        r,
-        JSON.stringify({ breaks: [{ start: "13:00", end: "14:00" }], timeOff: [{ start: at(300), end: at(360) }] }),
-      ]);
+      await addBreak(c, s.tenantId, r, "13:00", "14:00");
+      await addTimeOff(c, s.tenantId, r, at(300), at(360));
     });
     const tryAt = (min: number) => tx(env, ctx, (c) => createHold(c, ctx, hold(s, { resourceId: r, startsAt: at(min) })));
     await expectAppError(tryAt(3 * 60 + 30), ErrorCode.BOOKING_SLOT_TAKEN, (e) => assert.equal(e.details.reason, "outside_hours")); // 13:30 break
@@ -430,9 +431,8 @@ describe("hold rules", () => {
     const ctx = ctxFor(s.tenantId);
     await expectAppError(tx(env, ctx, (c) => createHold(c, ctx, hold(s, { resourceId: other.resourceIds[0] }))), ErrorCode.NOT_FOUND);
     await expectAppError(tx(env, ctx, (c) => createHold(c, ctx, hold(s, { resourceId: "00000000-0000-4000-8000-00000000dead" }))), ErrorCode.NOT_FOUND);
-    await tx(env, ctx, (c) =>
-      c.query("update resources set attributes = $2::jsonb where id = $1", [s.resourceIds[0], JSON.stringify({ serviceIds: ["00000000-0000-4000-8000-000000000001"] })]),
-    );
+    const other2 = await tx(env, ctx, (c) => insert(c, "catalogue_items", { tenant_id: s.tenantId, kind: "service", name: "Colour", base_price_paise: 90000, duration_minutes: 120 }));
+    await tx(env, ctx, (c) => allowServices(c, s.tenantId, s.resourceIds[0] as string, [other2]));
     await expectAppError(
       tx(env, ctx, (c) => createHold(c, ctx, hold(s, { resourceId: s.resourceIds[0] }))),
       ErrorCode.VALIDATION_FAILED,

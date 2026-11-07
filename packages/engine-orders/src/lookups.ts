@@ -4,6 +4,7 @@ import { toPaise } from "@qenbel/db";
 import {
   ErrorCode,
   ResourceType,
+  WebhookEvent,
   type CreateCustomer,
   type CustomerField,
   type EngineContext,
@@ -162,41 +163,66 @@ export function toE164(phone: string): string | null {
   return /^\+[1-9][0-9]{6,14}$/.test(e164) ? e164 : null;
 }
 
+const CUSTOMER_COLUMNS = "id, name, phone, email, attributes";
+
+async function findCustomer(sql: SqlClient, ctx: EngineContext, phone: string | null, email: string | undefined): Promise<CustomerRow | null> {
+  if (phone !== null) {
+    const hit = await sql.query<CustomerRow>(
+      `select ${CUSTOMER_COLUMNS} from customers where tenant_id = $1 and phone = $2 and archived_at is null order by created_at limit 1`,
+      [ctx.tenantId, phone],
+    );
+    if (hit.rows[0]) return hit.rows[0];
+  }
+  if (email !== undefined) {
+    const hit = await sql.query<CustomerRow>(
+      `select ${CUSTOMER_COLUMNS} from customers where tenant_id = $1 and lower(email) = lower($2) and archived_at is null order by created_at limit 1`,
+      [ctx.tenantId, email],
+    );
+    if (hit.rows[0]) return hit.rows[0];
+  }
+  return null;
+}
+
 /**
- * Inline customer on confirm_order: reuse an existing customer with the same phone (or email), else create one and
- * queue customer.created. An existing customer is never modified from here.
+ * Inline customer on a STAFF placement (customer channels cannot create or change the order's customer): reuse an
+ * existing customer with the same phone, else the same e-mail; otherwise create one and queue customer.created. An
+ * existing customer is never modified from here. A phone or e-mail that races another insert is re-looked-up; if it
+ * still cannot be resolved the answer is a neutral VALIDATION_FAILED, never the raw unique-violation, so the call is not
+ * an oracle for "this e-mail belongs to a customer".
  */
 export async function findOrCreateCustomer(sql: SqlClient, ctx: EngineContext, input: CreateCustomer): Promise<CustomerRow> {
   const phone = input.phone === undefined ? null : toE164(input.phone);
   if (input.phone !== undefined && phone === null) {
     throw orderError(ErrorCode.VALIDATION_FAILED, "PHONE_INVALID", "Enter a phone number with country code.");
   }
-  if (phone !== null) {
-    const hit = await sql.query<CustomerRow>(
-      "select id, name, phone, email, attributes from customers where tenant_id = $1 and phone = $2 and archived_at is null order by created_at limit 1",
-      [ctx.tenantId, phone],
-    );
-    if (hit.rows[0]) return hit.rows[0];
-  } else if (input.email !== undefined) {
-    const hit = await sql.query<CustomerRow>(
-      "select id, name, phone, email, attributes from customers where tenant_id = $1 and lower(email) = $2 and archived_at is null order by created_at limit 1",
-      [ctx.tenantId, input.email],
-    );
-    if (hit.rows[0]) return hit.rows[0];
-  }
+  const existing = await findCustomer(sql, ctx, phone, input.email);
+  if (existing) return existing;
+
   const attributes: Record<string, unknown> = {};
   if (input.dateOfBirth !== undefined) attributes.dateOfBirth = input.dateOfBirth;
   if (input.address !== undefined) attributes.address = input.address;
   const id = ctx.newId();
-  await sql.query(
-    `insert into customers (id, tenant_id, name, phone, email, source, attributes)
-     values ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-    [id, ctx.tenantId, input.name, phone, input.email ?? null, ctx.actor.channel, JSON.stringify(attributes)],
-  );
+  await sql.query("savepoint order_customer_insert");
+  try {
+    await sql.query(
+      `insert into customers (id, tenant_id, name, phone, email, source, attributes)
+       values ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [id, ctx.tenantId, input.name, phone, input.email ?? null, ctx.actor.channel, JSON.stringify(attributes)],
+    );
+    await sql.query("release savepoint order_customer_insert");
+  } catch (err) {
+    await sql.query("rollback to savepoint order_customer_insert");
+    if ((err as { code?: string }).code === "23505") {
+      const raced = await findCustomer(sql, ctx, phone, input.email);
+      if (raced) return raced;
+      throw orderError(ErrorCode.VALIDATION_FAILED, "CUSTOMER_UNRESOLVED", "These customer details could not be used.");
+    }
+    throw err;
+  }
   if (input.notes) {
     await sql.query("insert into customer_notes (tenant_id, customer_id, body) values ($1, $2, $3)", [ctx.tenantId, id, input.notes]);
   }
-  await emitEvent(sql, ctx, "customer.created", {
+  await emitEvent(sql, ctx, WebhookEvent.CUSTOMER_CREATED, {
     aggregateType: "customer",
     aggregateId: id,
     payload: { customerId: id, source: ctx.actor.channel, occurredAt: ctx.now().toISOString() },

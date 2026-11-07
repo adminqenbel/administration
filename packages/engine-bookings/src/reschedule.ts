@@ -13,6 +13,7 @@ import {
 import type { ResourceCandidate } from "./availability-source.ts";
 import { loadConfig, type EngineOptions } from "./config.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
+import { expireDueHolds } from "./expiry.ts";
 import { withIdempotency } from "./idempotency.ts";
 import { isLateChange, policyFor } from "./policy.ts";
 import { assertVersion, insertAllocations, loadActiveAllocations, loadBooking, lockResources, toView } from "./repo.ts";
@@ -45,6 +46,12 @@ export async function rescheduleBooking(
     const cfg = await loadConfig(sql, ctx, options);
     const source = options.availability ?? sqlAvailabilityDataSource;
     return withIdempotency(sql, ctx, "reschedule_booking", { bookingId, ...body }, async () => {
+      // Lock order: resources (ascending id) -> booking -> allocations. The resources are only known from the booking's
+      // allocations, so read them without a lock, lock the resources, then lock the booking and check nothing moved.
+      const peek = await loadActiveAllocations(sql, ctx, bookingId);
+      const peekIds = peek.map((a) => a.resource_id);
+      await lockResources(sql, ctx, body.resourceId !== undefined ? [...peekIds, body.resourceId] : peekIds);
+
       const row = await loadBooking(sql, ctx, bookingId, { lock: true });
       assertVersion(row, body.expectedVersion);
       if (row.status !== BookingStatus.CONFIRMED) {
@@ -75,6 +82,10 @@ export async function rescheduleBooking(
       else endMs = startMs + (row.ends_at.getTime() - row.starts_at.getTime());
 
       const current = await loadActiveAllocations(sql, ctx, bookingId);
+      if (current.length !== peek.length || current.some((a, i) => a.resource_id !== peek[i]?.resource_id)) {
+        // Another change moved the booking between our read and our lock. Nothing was written; retry.
+        throw new AppError(ErrorCode.VERSION_CONFLICT, undefined, { reason: "allocation_changed" });
+      }
       if (current.length === 0) throw new AppError(ErrorCode.CONFLICT, "This booking has no slot to move.");
       let targets: { resourceId: string; units: number }[] = current.map((a) => ({ resourceId: a.resource_id, units: a.units }));
       if (body.resourceId !== undefined) {
@@ -105,8 +116,8 @@ export async function rescheduleBooking(
       }
       const bufferMinutes = bufferFor(service, cfg);
 
-      // Lock old and new resources together, in id order.
-      await lockResources(sql, ctx, [...current.map((a) => a.resource_id), ...targets.map((t) => t.resourceId)]);
+      // Old and new resources are already locked (see above). Expire due holds on them in id order before the move.
+      await expireDueHolds(sql, ctx, { cutoff: null, resourceIds: targets.map((t) => t.resourceId), reason: "slot_requested" });
 
       await withSavepoint(sql, async () => {
         await sql.query(

@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { AppError, ErrorCode, FollowUpOrigin, FollowUpStatus, instantSchema, PrincipalKind } from "@qenbel/shared";
 import {
-  SetBuilder, assertRef, cursorSchema, decodeCursor, idArg, iso, isoReq, limitSchema, notFound, op, paise, text, toPage, tsText,
+  SetBuilder, assertRef, cursorSchema, decodeCursor, idArg, isStaffChannel, iso, isoReq, limitSchema, notFound, op, paise, staffOp, subjectCustomerId, text, toPage, tsText,
   type EngineContext, type SqlClient,
 } from "./common.ts";
 import { insertNote } from "./customers.ts";
@@ -10,6 +10,27 @@ import { insertNote } from "./customers.ts";
 async function assertCustomer(sql: SqlClient, ctx: EngineContext, customerId: string): Promise<void> {
   const res = await sql.query("select 1 from customers where tenant_id = $1 and id = $2", [ctx.tenantId, customerId]);
   if (res.rows.length === 0) throw notFound("Customer");
+}
+
+/**
+ * Customer-channel guard for the two functions a channel may call (escalation and communication log). On a customer
+ * channel everything the call refers to must belong to the verified subject (`ctx.subject`); anything else is NOT_FOUND
+ * (it does not say whether the record exists). Returns the subject's customer id, or null on a staff channel.
+ */
+async function assertSubjectOwns(
+  sql: SqlClient, ctx: EngineContext, refs: { customerId?: string | undefined; bookingId?: string | undefined; orderId?: string | undefined; conversationId?: string | undefined },
+): Promise<string | null> {
+  if (isStaffChannel(ctx)) return null;
+  const subject = subjectCustomerId(ctx);
+  if (subject === null) throw new AppError(ErrorCode.FORBIDDEN, "This action is not available on this channel.");
+  if (refs.customerId !== undefined && refs.customerId.toLowerCase() !== subject) throw notFound("Customer");
+  for (const [table, id, entity] of [["bookings", refs.bookingId, "Booking"], ["orders", refs.orderId, "Order"]] as const) {
+    if (id === undefined) continue;
+    const own = await sql.query(`select 1 from ${table} where tenant_id = $1 and id = $2 and customer_id = $3`, [ctx.tenantId, id, subject]);
+    if (own.rows.length === 0) throw notFound(entity);
+  }
+  if (refs.conversationId !== undefined && refs.conversationId.toLowerCase() !== (ctx.subject?.conversationId ?? "").toLowerCase()) throw notFound("Conversation");
+  return subject;
 }
 
 // ---- notes -------------------------------------------------------------------------------------------
@@ -35,7 +56,7 @@ const toNote = (r: NoteRow): NoteDto => ({
   id: r.id, customerId: r.customer_id, authorUserId: r.author_user_id, body: r.body, createdAt: isoReq(r.created_at),
 });
 
-export const addCustomerNote = op(
+export const addCustomerNote = staffOp(
   z.object({ customerId: idArg, body: text(1, 4000) }).strict(),
   async (sql, ctx, input): Promise<NoteDto> => {
     await assertCustomer(sql, ctx, input.customerId);
@@ -48,7 +69,7 @@ export const addCustomerNote = op(
   },
 );
 
-export const listCustomerNotes = op(
+export const listCustomerNotes = staffOp(
   z.object({ customerId: idArg, limit: limitSchema, cursor: cursorSchema }).strict(),
   async (sql, ctx, input) => {
     await assertCustomer(sql, ctx, input.customerId);
@@ -132,6 +153,8 @@ async function loadFollowUp(sql: SqlClient, ctx: EngineContext, id: string): Pro
   return toFollowUp(row);
 }
 
+const ESCALATION_WINDOW_MS = 30 * 60_000;
+
 /** Create a follow-up. Origin defaults from the actor (user: staff, API credential: ai_escalation, system: system). */
 export const createFollowUp = op(
   z
@@ -148,6 +171,22 @@ export const createFollowUp = op(
     })
     .strict(),
   async (sql, ctx, input): Promise<FollowUpDto> => {
+    const subject = await assertSubjectOwns(sql, ctx, input);
+    if (subject !== null) {
+      // A customer channel may only raise an escalation about its own verified customer. It cannot assign staff, set a
+      // due time, or pick the origin. Repeats within 30 minutes return the open task instead of piling up (SEC-014).
+      if (input.assignedUserId !== undefined || input.dueAt !== undefined || (input.origin !== undefined && input.origin !== FollowUpOrigin.AI_ESCALATION)) {
+        throw new AppError(ErrorCode.FORBIDDEN, "This action is not available on this channel.");
+      }
+      const recent = await sql.query<{ id: string }>(
+        `select id from follow_up_tasks
+          where tenant_id = $1 and customer_id = $2 and origin = $3 and status = $4 and created_at > $5
+          order by created_at desc, id desc limit 1`,
+        [ctx.tenantId, subject, FollowUpOrigin.AI_ESCALATION, FollowUpStatus.OPEN, new Date(ctx.now().getTime() - ESCALATION_WINDOW_MS)],
+      );
+      if (recent.rows[0]) return loadFollowUp(sql, ctx, recent.rows[0].id);
+      input = { ...input, customerId: subject, origin: FollowUpOrigin.AI_ESCALATION };
+    }
     if (input.customerId) await assertRef(sql, ctx, "customers", input.customerId, "customerId");
     if (input.bookingId) await assertRef(sql, ctx, "bookings", input.bookingId, "bookingId");
     if (input.orderId) await assertRef(sql, ctx, "orders", input.orderId, "orderId");
@@ -165,9 +204,9 @@ export const createFollowUp = op(
   },
 );
 
-export const getFollowUp = op(z.object({ followUpId: idArg }).strict(), (sql, ctx, input) => loadFollowUp(sql, ctx, input.followUpId));
+export const getFollowUp = staffOp(z.object({ followUpId: idArg }).strict(), (sql, ctx, input) => loadFollowUp(sql, ctx, input.followUpId));
 
-export const updateFollowUp = op(
+export const updateFollowUp = staffOp(
   z
     .object({
       followUpId: idArg,
@@ -192,7 +231,7 @@ export const updateFollowUp = op(
 );
 
 /** open -> done | cancelled, and done | cancelled -> open (reopen). Setting the current status is a no-op. */
-export const setFollowUpStatus = op(
+export const setFollowUpStatus = staffOp(
   z.object({ followUpId: idArg, status: z.enum(Object.values(FollowUpStatus) as [string, ...string[]]) }).strict(),
   async (sql, ctx, input): Promise<FollowUpDto> => {
     const cur = await sql.query<{ status: string }>("select status from follow_up_tasks where tenant_id = $1 and id = $2 for update", [ctx.tenantId, input.followUpId]);
@@ -209,7 +248,7 @@ export const setFollowUpStatus = op(
   },
 );
 
-export const listFollowUps = op(
+export const listFollowUps = staffOp(
   z
     .object({
       status: z.enum(Object.values(FollowUpStatus) as [string, ...string[]]).optional(),
@@ -299,6 +338,7 @@ export const logCommunication = op(
     .strict()
     .refine((v) => v.subject !== undefined || v.body !== undefined, "Provide a subject or a body"),
   async (sql, ctx, input): Promise<CommunicationDto> => {
+    await assertSubjectOwns(sql, ctx, input);
     await assertCustomer(sql, ctx, input.customerId);
     if (input.conversationId) await assertRef(sql, ctx, "conversations", input.conversationId, "conversationId");
     if (input.bookingId) await assertRef(sql, ctx, "bookings", input.bookingId, "bookingId");
@@ -317,7 +357,7 @@ export const logCommunication = op(
   },
 );
 
-export const listCommunications = op(
+export const listCommunications = staffOp(
   z.object({ customerId: idArg, limit: limitSchema, cursor: cursorSchema }).strict(),
   async (sql, ctx, input) => {
     await assertCustomer(sql, ctx, input.customerId);
@@ -367,7 +407,7 @@ interface TimelineRow {
  * Newest-first activity for one customer: bookings, orders, communications, notes and follow-ups, by read-only
  * joins. Communication bodies and note text are not included (summary is the subject/channel/first 120 chars).
  */
-export const getCustomerTimeline = op(
+export const getCustomerTimeline = staffOp(
   z
     .object({
       customerId: idArg,
@@ -435,7 +475,7 @@ export interface BalanceLine {
  * completed refunds on that order. Overpaying one order never offsets another. Booking deposits use
  * payments recorded against the booking with no order.
  */
-export const getCustomerBalance = op(z.object({ customerId: idArg }).strict(), async (sql, ctx, input) => {
+export const getCustomerBalance = staffOp(z.object({ customerId: idArg }).strict(), async (sql, ctx, input) => {
   await assertCustomer(sql, ctx, input.customerId);
   const res = await sql.query<{ currency: string; orders_due: string; deposits_due: string }>(
     `with ord as (

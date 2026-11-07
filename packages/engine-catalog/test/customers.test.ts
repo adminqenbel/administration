@@ -62,8 +62,8 @@ describe("createCustomer", () => {
 
   test("source defaults to the actor's channel and can be set", async () => {
     const t = await db.createTenant("cust-source");
-    const a = await call(db, makeCtx(t, { channel: "whatsapp" }), createCustomer, { name: "A" });
-    assert.equal(a.customer.source, "whatsapp");
+    const a = await call(db, makeCtx(t, { channel: "api" }), createCustomer, { name: "A" });
+    assert.equal(a.customer.source, "api");
     const b = await call(db, makeCtx(t), createCustomer, { name: "B", source: "voice" });
     assert.equal(b.customer.source, "voice");
   });

@@ -2,8 +2,8 @@
 import { z } from "zod";
 import { AppError, Channel, ErrorCode, localDateSchema, WebhookEvent } from "@qenbel/shared";
 import {
-  SetBuilder, count, cursorSchema, decodeCursor, emitEvent, idArg, iso, isoReq, likeEscape, limitSchema, lockKeys, notFound, op,
-  text, toPage, type EngineContext, type SqlClient,
+  CONTACT_UNIQUE_FIELDS, SetBuilder, subjectCustomerId, count, cursorSchema, decodeCursor, emitEvent, idArg, iso, isContactUnique, isoReq, likeEscape, limitSchema, lockKeys, notFound, op, staffOp,
+  text, toPage, withSavepoint, type EngineContext, type SqlClient,
 } from "./common.ts";
 import { maskEmail, maskPhone, normaliseEmail, normalisePhone } from "./phone.ts";
 
@@ -215,6 +215,16 @@ async function findMatches(
   return out;
 }
 
+/** The CONFLICT for a database unique violation on phone or email, naming the field and the customers that hold the value. */
+function contactConflict(err: unknown, candidateIds: readonly string[]): AppError {
+  const field = CONTACT_UNIQUE_FIELDS[(err as { constraint: string }).constraint] as "phone" | "email";
+  return new AppError(ErrorCode.CONFLICT, `Another customer already has this ${field === "phone" ? "phone number" : "email address"}.`, {
+    field,
+    ...(candidateIds.length === 1 ? { customerId: candidateIds[0] } : {}),
+    candidates: [...candidateIds],
+  });
+}
+
 // ---- create / update / archive -----------------------------------------------------------------------
 
 /**
@@ -223,7 +233,7 @@ async function findMatches(
  * so staff can choose. Concurrent creates of the same phone/email are serialised by advisory locks.
  * Writes `customer.created` to the outbox only when a row is actually created.
  */
-export const createCustomer = op(createCustomerInput, async (sql, ctx, input): Promise<CreateCustomerResult> => {
+export const createCustomer = staffOp(createCustomerInput, async (sql, ctx, input): Promise<CreateCustomerResult> => {
   await lockKeys(sql, ctx, contactLockKeys(input.phone, input.email));
   const matches = await findMatches(sql, ctx, input.phone, input.email);
   if (matches.length > 0) {
@@ -241,15 +251,30 @@ export const createCustomer = op(createCustomerInput, async (sql, ctx, input): P
   if (input.address !== undefined) attrs.address = input.address;
 
   const now = ctx.now();
-  const ins = await sql.query<{ id: string }>(
-    `insert into customers (tenant_id, name, phone, email, source, attributes, consent_marketing, consent_updated_at)
-     values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8) returning id`,
-    [
-      ctx.tenantId, input.name, input.phone ?? null, input.email ?? null, input.source ?? ctx.actor.channel,
-      JSON.stringify(attrs), input.consentMarketing ?? false, input.consentMarketing === undefined ? null : now,
-    ],
-  );
-  const id = (ins.rows[0] as { id: string }).id;
+  let id: string;
+  try {
+    // Savepoint: the database also enforces unique active phone / lower(email) (014). A writer that does not take our
+    // advisory locks can still win a race; then we re-read and answer as a dedupe instead of failing the transaction.
+    const ins = await withSavepoint(sql, () =>
+      sql.query<{ id: string }>(
+        `insert into customers (tenant_id, name, phone, email, source, attributes, consent_marketing, consent_updated_at)
+         values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8) returning id`,
+        [
+          ctx.tenantId, input.name, input.phone ?? null, input.email ?? null, input.source ?? ctx.actor.channel,
+          JSON.stringify(attrs), input.consentMarketing ?? false, input.consentMarketing === undefined ? null : now,
+        ],
+      ),
+    );
+    id = (ins.rows[0] as { id: string }).id;
+  } catch (err) {
+    if (!isContactUnique(err)) throw err;
+    const raced = await findMatches(sql, ctx, input.phone, input.email);
+    const ids = [...new Set(raced.map((m) => m.id))];
+    if (ids.length === 1) {
+      return { customer: await loadCustomer(sql, ctx, ids[0] as string), created: false, matchedBy: raced.some((m) => m.by === "phone") ? "phone" : "email" };
+    }
+    throw contactConflict(err, ids);
+  }
 
   for (const tag of new Set(input.tags ?? [])) {
     await sql.query("insert into customer_tags (tenant_id, customer_id, tag) values ($1, $2, $3)", [ctx.tenantId, id, tag]);
@@ -282,7 +307,7 @@ export async function insertNote(sql: SqlClient, ctx: EngineContext, customerId:
   return (res.rows[0] as { id: string }).id;
 }
 
-export const updateCustomer = op(updateCustomerInput, async (sql, ctx, input): Promise<CustomerDto> => {
+export const updateCustomer = staffOp(updateCustomerInput, async (sql, ctx, input): Promise<CustomerDto> => {
   const cur = await sql.query<CustomerRow>(
     "select id, name, phone, email, attributes, archived_at from customers where tenant_id = $1 and id = $2 for update",
     [ctx.tenantId, input.customerId],
@@ -300,6 +325,7 @@ export const updateCustomer = op(updateCustomerInput, async (sql, ctx, input): P
     throw new AppError(ErrorCode.CONFLICT, `Another customer already has this ${m.by === "phone" ? "phone number" : "email address"}.`, {
       field: m.by,
       customerId: m.id,
+      candidates: [...new Set(matches.map((x) => x.id))],
     });
   }
 
@@ -328,12 +354,18 @@ export const updateCustomer = op(updateCustomerInput, async (sql, ctx, input): P
     set.set("consent_updated_at", ctx.now());
   }
   set.set("attributes", JSON.stringify(attrs), "::jsonb");
-  await sql.query(`update customers set ${set.clause} where tenant_id = $1 and id = $2`, set.values);
+  try {
+    await withSavepoint(sql, () => sql.query(`update customers set ${set.clause} where tenant_id = $1 and id = $2`, set.values));
+  } catch (err) {
+    if (!isContactUnique(err)) throw err;
+    const raced = await findMatches(sql, ctx, input.phone === undefined ? null : input.phone, input.email === undefined ? null : input.email, input.customerId);
+    throw contactConflict(err, [...new Set(raced.map((m) => m.id))]);
+  }
   return loadCustomer(sql, ctx, input.customerId);
 });
 
 /** Soft delete. Idempotent: archiving an archived customer returns it unchanged. History stays linked. */
-export const archiveCustomer = op(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => {
+export const archiveCustomer = staffOp(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => {
   const res = await sql.query(
     "update customers set archived_at = coalesce(archived_at, $3) where tenant_id = $1 and id = $2 returning id",
     [ctx.tenantId, input.customerId, ctx.now()],
@@ -343,7 +375,7 @@ export const archiveCustomer = op(customerIdInput, async (sql, ctx, input): Prom
 });
 
 /** Undo archive. Refused if another active customer now has the same phone or email. */
-export const restoreCustomer = op(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => {
+export const restoreCustomer = staffOp(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => {
   const cur = await sql.query<CustomerRow>("select id, phone, email, archived_at from customers where tenant_id = $1 and id = $2 for update", [ctx.tenantId, input.customerId]);
   const row = cur.rows[0];
   if (!row) throw notFound("Customer");
@@ -351,13 +383,24 @@ export const restoreCustomer = op(customerIdInput, async (sql, ctx, input): Prom
   await lockKeys(sql, ctx, contactLockKeys(row.phone, row.email));
   const matches = await findMatches(sql, ctx, row.phone, row.email, input.customerId);
   if (matches.length > 0) {
-    throw new AppError(ErrorCode.CONFLICT, "Another customer now has this phone number or email address.", { customerId: (matches[0] as Match).id });
+    const m = matches[0] as Match;
+    throw new AppError(ErrorCode.CONFLICT, "Another customer now has this phone number or email address.", {
+      field: m.by,
+      customerId: m.id,
+      candidates: [...new Set(matches.map((x) => x.id))],
+    });
   }
-  await sql.query("update customers set archived_at = null where tenant_id = $1 and id = $2", [ctx.tenantId, input.customerId]);
+  try {
+    await withSavepoint(sql, () => sql.query("update customers set archived_at = null where tenant_id = $1 and id = $2", [ctx.tenantId, input.customerId]));
+  } catch (err) {
+    if (!isContactUnique(err)) throw err;
+    const raced = await findMatches(sql, ctx, row.phone, row.email, input.customerId);
+    throw contactConflict(err, [...new Set(raced.map((m) => m.id))]);
+  }
   return loadCustomer(sql, ctx, input.customerId);
 });
 
-export const getCustomer = op(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => loadCustomer(sql, ctx, input.customerId));
+export const getCustomer = staffOp(customerIdInput, async (sql, ctx, input): Promise<CustomerDto> => loadCustomer(sql, ctx, input.customerId));
 
 // ---- search ------------------------------------------------------------------------------------------
 
@@ -365,7 +408,7 @@ export const getCustomer = op(customerIdInput, async (sql, ctx, input): Promise<
  * Staff search: full records. `query` matches name or email (partial) and phone (digits, partial).
  * `phone` and `email` are exact matches on the normalised value. No filters lists everyone (paged, by name).
  */
-export const searchCustomers = op(searchCustomersInput, async (sql, ctx, input) => {
+export const searchCustomers = staffOp(searchCustomersInput, async (sql, ctx, input) => {
   const cur = decodeCursor(input.cursor, 2);
   const where: string[] = ["c.tenant_id = $1"];
   const params: unknown[] = [ctx.tenantId];
@@ -399,16 +442,30 @@ export const searchCustomers = op(searchCustomersInput, async (sql, ctx, input) 
 });
 
 /**
- * AI-safe search: minimal fields only, at most 5 results, never lists everyone. Phone and email are exact
+ * AI-facing customer lookup: minimal fields only, at most 5 results, never lists everyone. Phone and email are exact
  * matches; name is a partial match. Archived customers are never returned. Display name is the first name.
+ *
+ * Two modes, chosen by the channel in `ctx` (never by input):
+ *  - Dashboard (staff): a tenant-wide lookup of the minimal summaries above.
+ *  - Every other channel (web_chat, whatsapp, voice, api, and any channel this package does not know): NOT a lookup. It can
+ *    only confirm the customer the channel layer verified (`ctx.subject.customerId`): the filters given must all match
+ *    that one record, and the only possible result is that record's own minimal summary. Another customer's id, name
+ *    fragment, masked contact or booking flag is unreachable (the query is bound to the subject's id). Without a
+ *    verified subject, or when nothing matches, the answer is the same empty list: no error and no SQL on the
+ *    no-subject path, so nothing can be learnt about who is a customer.
  */
 export const searchCustomersForAi = op(searchCustomersForAiInput, async (sql, ctx, input): Promise<{ customers: CustomerAiSummary[] }> => {
+  // Only the dashboard may look across the tenant. `api` (API keys, including voice platforms) is treated like a customer channel here.
+  const staff = ctx.actor?.channel === Channel.DASHBOARD;
+  const subject = subjectCustomerId(ctx);
+  if (!staff && subject === null) return { customers: [] };
   const where: string[] = ["c.tenant_id = $1", "c.archived_at is null"];
   const params: unknown[] = [ctx.tenantId, ctx.now()];
   const add = (v: unknown): string => {
     params.push(v);
     return `$${params.length}`;
   };
+  if (!staff) where.push(`c.id = ${add(subject)}::uuid`);
   if (input.phone) where.push(`c.phone = ${add(input.phone)}`);
   if (input.email) where.push(`lower(c.email) = ${add(input.email)}`);
   if (input.name) where.push(`lower(c.name) like ${add(`%${likeEscape(input.name.toLowerCase())}%`)} escape '\\'`);
@@ -437,7 +494,7 @@ export const searchCustomersForAi = op(searchCustomersForAiInput, async (sql, ct
 const tagArgs = z.object({ customerId: idArg, tag: tagInput }).strict();
 const MAX_TAGS_PER_CUSTOMER = 50;
 
-export const addCustomerTag = op(tagArgs, async (sql, ctx, input): Promise<CustomerDto> => {
+export const addCustomerTag = staffOp(tagArgs, async (sql, ctx, input): Promise<CustomerDto> => {
   const own = await sql.query<{ n: string }>(
     "select (select count(*) from customer_tags where tenant_id = $1 and customer_id = $2) as n from customers where tenant_id = $1 and id = $2 for update",
     [ctx.tenantId, input.customerId],
@@ -453,7 +510,7 @@ export const addCustomerTag = op(tagArgs, async (sql, ctx, input): Promise<Custo
   return loadCustomer(sql, ctx, input.customerId);
 });
 
-export const removeCustomerTag = op(tagArgs, async (sql, ctx, input): Promise<CustomerDto> => {
+export const removeCustomerTag = staffOp(tagArgs, async (sql, ctx, input): Promise<CustomerDto> => {
   const exists = await sql.query("select 1 from customers where tenant_id = $1 and id = $2", [ctx.tenantId, input.customerId]);
   if (exists.rows.length === 0) throw notFound("Customer");
   await sql.query("delete from customer_tags where tenant_id = $1 and customer_id = $2 and tag = $3", [ctx.tenantId, input.customerId, input.tag]);
@@ -461,7 +518,7 @@ export const removeCustomerTag = op(tagArgs, async (sql, ctx, input): Promise<Cu
 });
 
 /** Distinct tags in use in this tenant with their counts (active customers only). */
-export const listTags = op(z.object({}).strict(), async (sql, ctx) => {
+export const listTags = staffOp(z.object({}).strict(), async (sql, ctx) => {
   const res = await sql.query<{ tag: string; n: string }>(
     `select t.tag, count(*) as n from customer_tags t join customers c on c.tenant_id = t.tenant_id and c.id = t.customer_id
       where t.tenant_id = $1 and c.archived_at is null group by t.tag order by t.tag limit 500`,

@@ -8,10 +8,10 @@ import { makeCtx } from "./helpers.ts";
 /** Pure helpers and functions that take no caller input. Everything else is an `op` taking an input object. */
 const PURE = new Set([
   "breaksOf", "emptyWeek", "generateAllSlots", "generateResourceSlots", "intersectIntervals", "maskEmail", "maskPhone", "normaliseEmail",
-  "normalisePhone", "peakUnits", "readExtras", "readSettings", "slotRequestFor", "weekFromRows",
+  "normalisePhone", "peakUnits", "readSettings", "slotRequestFor", "weekFromRows",
 ]);
 /** Internal helpers that take a client and context but are not entry points. */
-const INTERNAL = new Set(["insertNote", "readLocationHours"]);
+const INTERNAL = new Set(["insertNote", "readLocationHours", "loadWeeklyBreaks"]);
 /** Entry points with no input object: nothing to smuggle a tenant id into. */
 const NO_INPUT = new Set(["getBusinessProfile", "getBusinessProfileForChannel"]);
 

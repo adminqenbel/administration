@@ -27,6 +27,14 @@ export interface EngineContext {
   /** injected id generator (defaults to crypto.randomUUID in callers) */
   newId: () => string;
   idempotencyKey?: string;
+  /**
+   * The verified end customer on whose behalf a customer-channel call runs (web_chat, whatsapp, voice).
+   * Set ONLY by the channel layer from the verified contact (e.g. the WhatsApp sender number matched to a
+   * customer, or the voice caller id), never from model/tool arguments. Customer-scoped engine operations
+   * (cancel/reschedule/confirm a booking, view/cancel an order, customer search) MUST fail closed on
+   * customer channels when this is missing or does not own the target. Staff on the dashboard do not use it.
+   */
+  subject?: { customerId?: string; conversationId?: string };
 }
 
 /** Domain event written to outbox_events by engines in the same transaction as the change. */

@@ -155,8 +155,6 @@ export const placeOrderInputSchema = z
     customerId: idSchema.optional(),
     customer: createCustomerSchema.optional(),
     expectedVersion: expectedVersion.optional(),
-    /** Set by the channel layer for customer-facing calls: the order must belong to this customer. */
-    onBehalfOfCustomerId: idSchema.optional(),
   })
   .strict()
   .refine((v) => v.customerId === undefined || v.customer === undefined, {
@@ -179,8 +177,6 @@ export const cancelOrderInputSchema = z
     reason: reason.optional(),
     /** Method recorded on the automatic refund entry when a paid order is cancelled. Default 'other'. */
     refundMethod: z.enum(PaymentMethod).optional(),
-    /** Set by the channel layer for customer-facing calls: the order must belong to this customer. */
-    onBehalfOfCustomerId: idSchema.optional(),
   })
   .strict();
 export type CancelOrderInput = z.input<typeof cancelOrderInputSchema>;
@@ -230,12 +226,11 @@ export const listPaymentsInputSchema = z.object({ orderId }).strict();
 export type ListPaymentsInput = z.input<typeof listPaymentsInputSchema>;
 
 /**
- * Status for an AI or WhatsApp channel. `customerId` is resolved by the channel layer from the verified contact,
- * never from the model. Exactly one of orderId or orderReference.
+ * Status for an AI or WhatsApp channel. The customer is NOT an input: it is `ctx.subject.customerId`, set by the channel
+ * layer from the verified contact. Exactly one of orderId or orderReference.
  */
 export const orderStatusForChannelInputSchema = z
   .object({
-    customerId: idSchema,
     orderId: idSchema.optional(),
     orderReference: plainText(32).pipe(z.string().min(3)).optional(),
   })
@@ -256,7 +251,7 @@ export type ListOrdersInput = z.input<typeof listOrdersInputSchema>;
 export const orderBoardInputSchema = z
   .object({
     statuses: z.array(z.enum(OrderStatus)).min(1).max(9).optional(),
-    limitPerStatus: z.number().int().min(1).max(100).default(25),
+    limitPerStatus: z.number().int().min(1).max(50).default(25),
   })
   .strict();
 export type OrderBoardInput = z.input<typeof orderBoardInputSchema>;

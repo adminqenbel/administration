@@ -1,6 +1,6 @@
 // What the availability code needs to read, behind a small interface so the catalogue engine's loader
 // can replace the private SQL reader later (pass it as EngineOptions.availability).
-import type { AllocationMode, EngineContext, ResourceType, SqlClient, TimeInterval, TimeRange } from "@qenbel/shared";
+import type { AllocationMode, EngineContext, ResourceType, SqlClient, TimeRange } from "@qenbel/shared";
 
 export interface ResourceSummary {
   id: string;
@@ -47,6 +47,9 @@ export interface ScheduleRow extends HourRow {
   validTo: string | null;
 }
 
+/** A recurring break on one weekday (0 = Sunday ... 6 = Saturday), local time "HH:MM". */
+export type BreakRow = HourRow;
+
 export interface HolidayRow {
   /** Local date YYYY-MM-DD. */
   date: string;
@@ -69,8 +72,8 @@ export interface ResourceAvailabilityInputs {
   /** The resource's own weekly pattern. Empty means "follows the location". */
   resourceHours: ScheduleRow[];
   holidays: HolidayRow[];
-  /** Resource-specific daily breaks, or null to use the tenant/pack breaks. */
-  breaks: TimeInterval[] | null;
+  /** The resource's own weekly breaks (resource_breaks), or null when it has none (tenant/pack breaks apply). */
+  breaks: BreakRow[] | null;
   timeOff: TimeRange[];
   allocations: AllocationRow[];
   /** True when stored data for this resource could not be understood. The resource is then treated as unavailable. */

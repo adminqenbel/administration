@@ -9,7 +9,7 @@ import {
 } from "@qenbel/shared";
 import { hm, idArg, notFound, op } from "./common.ts";
 import { emptyWeek, readLocationHours, weekFromRows } from "./business.ts";
-import { ELIGIBLE_SQL, readExtras } from "./resources.ts";
+import { ELIGIBLE_SQL, loadWeeklyBreaks } from "./resources.ts";
 
 export const MAX_AVAILABILITY_RANGE_DAYS = 31;
 const MAX_RESOURCES = 200;
@@ -33,8 +33,13 @@ export interface ResourceAvailabilityInput {
   hours: WeeklyHours;
   /** Local dates (inside the requested range) whose intervals differ from `hours`, with that day's effective intervals. */
   dateOverrides: Record<string, TimeInterval[]>;
-  /** Extra daily breaks for this resource, local time, every day. */
-  breaks: TimeInterval[];
+  /**
+   * The resource's own breaks per local weekday (resource_breaks). All seven days empty means the resource has no
+   * break rows of its own (`hasOwnBreaks` false), so the caller's default breaks apply.
+   */
+  breaks: Record<Weekday, TimeInterval[]>;
+  /** True when the resource has break rows (even if some weekdays have none). */
+  hasOwnBreaks: boolean;
   /** Local dates closed all day (holidays for this location or for all locations). */
   holidays: string[];
   /** Time off overlapping the range, as UTC instants. generateSlots does not know about it: use `generateResourceSlots`. */
@@ -212,8 +217,8 @@ export const loadAvailabilityInputs = op(inputSchema, async (sql, ctx, input): P
     const p = add(input.partySize);
     where.push(`r.capacity_units >= ${p}::int and (r.allocation_mode = 'shared' or r.min_units <= ${p}::int)`);
   }
-  const rres = await sql.query<{ id: string; name: string; type: string; allocation_mode: "exclusive" | "shared"; capacity_units: number; min_units: number; attributes: Record<string, unknown> | null }>(
-    `select r.id, r.name, r.type, r.allocation_mode, r.capacity_units, r.min_units, r.attributes
+  const rres = await sql.query<{ id: string; name: string; type: string; allocation_mode: "exclusive" | "shared"; capacity_units: number; min_units: number }>(
+    `select r.id, r.name, r.type, r.allocation_mode, r.capacity_units, r.min_units
        from ${fromSql} where ${where.join(" and ")} order by lower(r.name), r.id limit ${MAX_RESOURCES}`,
     params,
   );
@@ -239,10 +244,25 @@ export const loadAvailabilityInputs = op(inputSchema, async (sql, ctx, input): P
     });
   }
 
-  // schedules and allocations for all candidates at once
+  // schedules, breaks, time off and allocations for all candidates at once
   const schedules = new Map<string, ScheduleRow[]>();
   const allocations = new Map<string, AllocationRange[]>();
+  const breaksByResource = await loadWeeklyBreaks(sql, ctx, ids);
+  const timeOffByResource = new Map<string, TimeRange[]>();
   if (ids.length > 0) {
+    // half-open overlap with the window: starts_at < windowEnd and ends_at > windowStart
+    const tres = await sql.query<{ resource_id: string; s: Date; e: Date }>(
+      `select resource_id, starts_at as s, ends_at as e from resource_time_off
+        where tenant_id = $1 and resource_id = any($2::uuid[]) and starts_at < $4 and ends_at > $3
+        order by starts_at, id`,
+      [ctx.tenantId, ids, new Date(windowStart), new Date(windowEnd)],
+    );
+    for (const t of tres.rows) {
+      const list = timeOffByResource.get(t.resource_id) ?? [];
+      list.push({ start: t.s.toISOString(), end: t.e.toISOString() });
+      timeOffByResource.set(t.resource_id, list);
+    }
+
     const sres = await sql.query<ScheduleRow>(
       `select resource_id, weekday, start_time::text as s, end_time::text as e, valid_from::text as vf, valid_to::text as vt
          from resource_schedules where tenant_id = $1 and resource_id = any($2::uuid[]) order by weekday, start_time`,
@@ -301,10 +321,7 @@ export const loadAvailabilityInputs = op(inputSchema, async (sql, ctx, input): P
       if (!sameIntervals(effective, hours[wd])) dateOverrides[date] = effective;
     }
 
-    const extras = readExtras(r.attributes);
-    const timeOff = extras.timeOff
-      .filter((t) => Date.parse(t.startsAt) < windowEnd && Date.parse(t.endsAt) > windowStart)
-      .map((t) => ({ start: t.startsAt, end: t.endsAt }));
+    const ownBreaks = breaksByResource.get(r.id);
 
     return {
       resourceId: r.id,
@@ -315,9 +332,10 @@ export const loadAvailabilityInputs = op(inputSchema, async (sql, ctx, input): P
       minUnits: r.min_units,
       hours,
       dateOverrides,
-      breaks: extras.breaks,
+      breaks: ownBreaks ?? emptyWeek(),
+      hasOwnBreaks: ownBreaks !== undefined,
       holidays,
-      timeOff,
+      timeOff: timeOffByResource.get(r.id) ?? [],
       allocations: allocations.get(r.id) ?? [],
     };
   });
@@ -349,7 +367,7 @@ export function slotRequestFor(inputs: AvailabilityInputs, resource: ResourceAva
     timezone: inputs.timezone,
     date,
     hours,
-    breaks: resource.breaks,
+    breaks: resource.breaks[wd],
     holidays: resource.holidays,
     allocations: resource.allocationMode === "exclusive" ? resource.allocations : [],
     durationMinutes: inputs.service.durationMinutes,

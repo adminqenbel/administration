@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { AppError, CatalogueItemKind, ErrorCode, ResourceType } from "@qenbel/shared";
 import {
-  SetBuilder, assertRef, count, cursorSchema, decodeCursor, idArg, isoReq, iso, likeEscape, limitSchema, notFound, op, paise, text, toPage,
+  SetBuilder, assertRef, count, cursorSchema, decodeCursor, idArg, isoReq, iso, likeEscape, limitSchema, notFound, op, paise, staffOp, text, toPage,
   type EngineContext, type SqlClient,
 } from "./common.ts";
 
@@ -231,7 +231,7 @@ function checkKindRules(kind: string, durationMinutes: number | null | undefined
 
 // ---- items -------------------------------------------------------------------------------------------
 
-export const createCatalogueItem = op(createItemInput, async (sql, ctx, input): Promise<ItemDto> => {
+export const createCatalogueItem = staffOp(createItemInput, async (sql, ctx, input): Promise<ItemDto> => {
   checkKindRules(input.kind, input.durationMinutes, input.requiredResourceType);
   if (input.categoryId) await assertRef(sql, ctx, "catalogue_categories", input.categoryId, "categoryId");
   const res = await sql.query<{ id: string }>(
@@ -247,9 +247,9 @@ export const createCatalogueItem = op(createItemInput, async (sql, ctx, input): 
   return loadItem(sql, ctx, (res.rows[0] as { id: string }).id);
 });
 
-export const getCatalogueItem = op(itemIdInput, (sql, ctx, input) => loadItem(sql, ctx, input.itemId));
+export const getCatalogueItem = staffOp(itemIdInput, (sql, ctx, input) => loadItem(sql, ctx, input.itemId));
 
-export const updateCatalogueItem = op(updateItemInput, async (sql, ctx, input): Promise<ItemDto> => {
+export const updateCatalogueItem = staffOp(updateItemInput, async (sql, ctx, input): Promise<ItemDto> => {
   const cur = await sql.query<ItemRow>(`select ${ITEM_COLS} from ${ITEM_FROM} where i.tenant_id = $1 and i.id = $2 for update of i`, [ctx.tenantId, input.itemId]);
   const row = cur.rows[0];
   if (!row) throw notFound("Catalogue item");
@@ -278,7 +278,7 @@ export const updateCatalogueItem = op(updateItemInput, async (sql, ctx, input): 
 });
 
 /** Soft delete. Idempotent. Past bookings and orders keep pointing at the item. */
-export const archiveCatalogueItem = op(itemIdInput, async (sql, ctx, input): Promise<ItemDto> => {
+export const archiveCatalogueItem = staffOp(itemIdInput, async (sql, ctx, input): Promise<ItemDto> => {
   const res = await sql.query("update catalogue_items set archived_at = coalesce(archived_at, $3) where tenant_id = $1 and id = $2 returning id", [
     ctx.tenantId, input.itemId, ctx.now(),
   ]);
@@ -287,13 +287,13 @@ export const archiveCatalogueItem = op(itemIdInput, async (sql, ctx, input): Pro
 });
 
 /** Undo archive. CONFLICT if another live item now has the same SKU. */
-export const restoreCatalogueItem = op(itemIdInput, async (sql, ctx, input): Promise<ItemDto> => {
+export const restoreCatalogueItem = staffOp(itemIdInput, async (sql, ctx, input): Promise<ItemDto> => {
   const res = await sql.query("update catalogue_items set archived_at = null where tenant_id = $1 and id = $2 returning id", [ctx.tenantId, input.itemId]);
   if (res.rows.length === 0) throw notFound("Catalogue item");
   return loadItem(sql, ctx, input.itemId);
 });
 
-export const listCatalogueItems = op(listItemsInput, async (sql, ctx, input) => {
+export const listCatalogueItems = staffOp(listItemsInput, async (sql, ctx, input) => {
   const cur = decodeCursor(input.cursor, 3);
   const where = ["i.tenant_id = $1"];
   const params: unknown[] = [ctx.tenantId];
@@ -341,7 +341,7 @@ async function loadVariant(sql: SqlClient, ctx: EngineContext, id: string): Prom
   return toVariant(row);
 }
 
-export const createVariant = op(
+export const createVariant = staffOp(
   z
     .object({
       itemId: idArg,
@@ -374,7 +374,7 @@ export const createVariant = op(
 );
 
 /** Variants are deactivated (`active: false`), never deleted: past orders and bookings refer to them. */
-export const updateVariant = op(
+export const updateVariant = staffOp(
   z
     .object({
       variantId: idArg,
@@ -401,7 +401,7 @@ export const updateVariant = op(
   },
 );
 
-export const listVariants = op(z.object({ itemId: idArg, includeInactive: z.boolean().default(false) }).strict(), async (sql, ctx, input) => {
+export const listVariants = staffOp(z.object({ itemId: idArg, includeInactive: z.boolean().default(false) }).strict(), async (sql, ctx, input) => {
   await assertRef(sql, ctx, "catalogue_items", input.itemId, "itemId");
   return (await loadVariants(sql, ctx, [input.itemId], !input.includeInactive)).get(input.itemId) ?? [];
 });
@@ -442,7 +442,7 @@ async function loadCategory(sql: SqlClient, ctx: EngineContext, id: string): Pro
   return toCategory(row);
 }
 
-export const createCategory = op(
+export const createCategory = staffOp(
   z
     .object({ name: text(1, 200), parentId: idArg.optional(), sortOrder: z.number().int().min(-100000).max(100000).default(0), active: z.boolean().default(true) })
     .strict(),
@@ -456,7 +456,7 @@ export const createCategory = op(
   },
 );
 
-export const updateCategory = op(
+export const updateCategory = staffOp(
   z
     .object({
       categoryId: idArg,
@@ -493,7 +493,7 @@ export const updateCategory = op(
   },
 );
 
-export const listCategories = op(z.object({}).strict(), async (sql, ctx): Promise<CategoryDto[]> => {
+export const listCategories = staffOp(z.object({}).strict(), async (sql, ctx): Promise<CategoryDto[]> => {
   const res = await sql.query<CategoryRow>(
     `select c.id, c.parent_id, c.name, c.sort_order, c.active,
             (select count(*) from catalogue_items i where i.tenant_id = c.tenant_id and i.category_id = c.id and i.archived_at is null) as item_count
@@ -504,7 +504,7 @@ export const listCategories = op(z.object({}).strict(), async (sql, ctx): Promis
 });
 
 /** Only an empty category can be removed: no items (archived ones included) and no child categories. */
-export const deleteCategory = op(z.object({ categoryId: idArg }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
+export const deleteCategory = staffOp(z.object({ categoryId: idArg }).strict(), async (sql, ctx, input): Promise<{ deleted: true }> => {
   const exists = await sql.query("select 1 from catalogue_categories where tenant_id = $1 and id = $2 for update", [ctx.tenantId, input.categoryId]);
   if (exists.rows.length === 0) throw notFound("Category");
   const used = await sql.query<{ items: string; children: string }>(

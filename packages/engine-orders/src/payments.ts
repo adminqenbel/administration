@@ -8,6 +8,7 @@ import { insertLedgerEntry, paymentEntryView, refreshPaymentStatus, type Payment
 import { netPaidPaise, outstandingPaise } from "./ledger.ts";
 import { moveToRefundedIfFullyRefunded } from "./lifecycle.ts";
 import { loadPackContext } from "./pack.ts";
+import { requireStaff } from "./scope.ts";
 import {
   listPaymentsInputSchema,
   recordPaymentInputSchema,
@@ -53,6 +54,7 @@ async function loadResult(sql: SqlClient, ctx: EngineContext, paymentId: string)
  */
 export async function recordPayment(sql: SqlClient, ctx: EngineContext, rawInput: RecordPaymentInput): Promise<PaymentResult> {
   const input = parseInput(recordPaymentInputSchema, rawInput);
+  requireStaff(ctx, "recordPayment");
   await assertTenantSession(sql, ctx);
   try {
     return await withIdempotency(
@@ -94,11 +96,11 @@ export async function recordPayment(sql: SqlClient, ctx: EngineContext, rawInput
 /**
  * Record money returned. Rejected: a draft order, an amount above what the order holds (payments minus refunds).
  * When a FULFILLED order becomes fully refunded and the pack allows FULFILLED -> REFUNDED, the order moves to REFUNDED
- * (version +1). Idempotent on ctx.idempotencyKey. The webhook vocabulary has no refund event: this queues
- * `payment.completed` with payload.kind = "refund".
+ * (version +1). Idempotent on ctx.idempotencyKey. Queues `payment.refunded`.
  */
 export async function recordRefund(sql: SqlClient, ctx: EngineContext, rawInput: RecordRefundInput): Promise<PaymentResult> {
   const input = parseInput(recordRefundInputSchema, rawInput);
+  requireStaff(ctx, "recordRefund");
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, false);
   try {
@@ -142,10 +144,11 @@ export async function recordRefund(sql: SqlClient, ctx: EngineContext, rawInput:
 /** Ledger entries for one order, oldest first, with the balance summary. */
 export async function listPayments(sql: SqlClient, ctx: EngineContext, rawInput: ListPaymentsInput): Promise<PaymentList> {
   const input = parseInput(listPaymentsInputSchema, rawInput);
+  requireStaff(ctx, "listPayments");
   await assertTenantSession(sql, ctx);
   const order = await loadOrderRow(sql, ctx, input.orderId, false);
   const res = await sql.query<PaymentRow>(
-    "select * from payments where tenant_id = $1 and order_id = $2 order by occurred_at, created_at, id",
+    "select * from payments where tenant_id = $1 and order_id = $2 order by occurred_at, created_at, id limit 500",
     [ctx.tenantId, order.id],
   );
   const sums = await loadLedgerSums(sql, ctx, order.id);
