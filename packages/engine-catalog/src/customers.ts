@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { AppError, Channel, ErrorCode, localDateSchema, WebhookEvent } from "@qenbel/shared";
 import {
-  CONTACT_UNIQUE_FIELDS, SetBuilder, subjectCustomerId, count, cursorSchema, decodeCursor, emitEvent, idArg, iso, isContactUnique, isoReq, likeEscape, limitSchema, lockKeys, notFound, op, staffOp,
+  CONTACT_UNIQUE_FIELDS, SetBuilder, isStaffChannel, subjectCustomerId, count, cursorSchema, decodeCursor, emitEvent, idArg, iso, isContactUnique, isoReq, likeEscape, limitSchema, lockKeys, notFound, op, staffOp,
   text, toPage, withSavepoint, type EngineContext, type SqlClient,
 } from "./common.ts";
 import { maskEmail, maskPhone, normaliseEmail, normalisePhone } from "./phone.ts";
@@ -446,8 +446,8 @@ export const searchCustomers = staffOp(searchCustomersInput, async (sql, ctx, in
  * matches; name is a partial match. Archived customers are never returned. Display name is the first name.
  *
  * Two modes, chosen by the channel in `ctx` (never by input):
- *  - Dashboard (staff): a tenant-wide lookup of the minimal summaries above.
- *  - Every other channel (web_chat, whatsapp, voice, api, and any channel this package does not know): NOT a lookup. It can
+ *  - Trusted channels (dashboard, api): a tenant-wide lookup of the minimal summaries above.
+ *  - Customer channels (web_chat, whatsapp, voice, and any value outside the Channel enum): NOT a lookup. It can
  *    only confirm the customer the channel layer verified (`ctx.subject.customerId`): the filters given must all match
  *    that one record, and the only possible result is that record's own minimal summary. Another customer's id, name
  *    fragment, masked contact or booking flag is unreachable (the query is bound to the subject's id). Without a
@@ -455,8 +455,7 @@ export const searchCustomers = staffOp(searchCustomersInput, async (sql, ctx, in
  *    no-subject path, so nothing can be learnt about who is a customer.
  */
 export const searchCustomersForAi = op(searchCustomersForAiInput, async (sql, ctx, input): Promise<{ customers: CustomerAiSummary[] }> => {
-  // Only the dashboard may look across the tenant. `api` (API keys, including voice platforms) is treated like a customer channel here.
-  const staff = ctx.actor?.channel === Channel.DASHBOARD;
+  const staff = isStaffChannel(ctx);
   const subject = subjectCustomerId(ctx);
   if (!staff && subject === null) return { customers: [] };
   const where: string[] = ["c.tenant_id = $1", "c.archived_at is null"];

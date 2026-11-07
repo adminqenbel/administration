@@ -15,7 +15,8 @@ import { notFound, orderError } from "./common.ts";
 const CUSTOMER_CHANNELS: readonly Channel[] = [Channel.WEB_CHAT, Channel.WHATSAPP, Channel.VOICE];
 
 export function isCustomerChannel(ctx: EngineContext): boolean {
-  return CUSTOMER_CHANNELS.includes(ctx.actor.channel);
+  // Fail closed: anything that is not an explicitly trusted channel is treated as a customer channel.
+  return !(ctx.actor.channel === Channel.DASHBOARD || ctx.actor.channel === Channel.API);
 }
 
 export function subjectCustomerId(ctx: EngineContext): string | undefined {

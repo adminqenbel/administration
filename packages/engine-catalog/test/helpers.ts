@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  createPool, resolveDatabaseUrls, runMigrations, TEST_DATABASE, withTenant,
+  createPool, createTestTenant, resolveDatabaseUrls, runMigrations, TEST_DATABASE, withTenant,
   type Pool, type PoolClient,
 } from "@qenbel/db";
 import { Channel, PrincipalKind, type EngineContext } from "@qenbel/shared";
@@ -44,22 +44,7 @@ export async function connectTestDb(): Promise<TestDb> {
     owner,
     async createTenant(prefix) {
       const slug = `${prefix}-${randomUUID().slice(0, 8)}`.toLowerCase();
-      // Since migration 017 the runtime role cannot call platform_create_tenant (only the platform ops role can). The suite
-      // has no ops login, so the owner role steps into qenbel_platform for this one statement, as the migrations do.
-      const client = await owner.connect();
-      let id: string;
-      try {
-        await client.query("begin");
-        await client.query("set local role qenbel_platform");
-        const res = await client.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Test ${slug}`]);
-        await client.query("commit");
-        id = (res.rows[0] as { id: string }).id;
-      } catch (err) {
-        await client.query("rollback").catch(() => undefined);
-        throw err;
-      } finally {
-        client.release();
-      }
+      const id = await createTestTenant(owner, { slug, name: `Test ${slug}` });
       tenants.push(id);
       return id;
     },

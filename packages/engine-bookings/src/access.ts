@@ -23,7 +23,8 @@ export const CUSTOMER_CHANNELS: readonly Channel[] = [Channel.WEB_CHAT, Channel.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isCustomerChannel(ctx: EngineContext): boolean {
-  return CUSTOMER_CHANNELS.includes(ctx.actor.channel);
+  // Fail closed: anything that is not an explicitly trusted channel is treated as a customer channel.
+  return !(ctx.actor.channel === Channel.DASHBOARD || ctx.actor.channel === Channel.API);
 }
 
 export interface Subject {

@@ -108,9 +108,10 @@ export function mapPgError(err: unknown): unknown {
 // ---- channel gating ---------------------------------------------------------------------------------
 
 /**
- * Channels whose callers are staff or trusted integrations (the dashboard, and the authenticated REST API whose routes
- * carry their own permission checks). Everything else (web_chat, whatsapp, voice, and any value this list does not
- * know) is an end-customer channel and is treated as untrusted: fail closed.
+ * Same split as engine-bookings (src/access.ts) and engine-orders (src/scope.ts): web_chat, whatsapp and voice are
+ * end-customer channels; dashboard (staff) and api (a trusted server integration with its own credential, whose
+ * permissions and tool scopes the API enforces) are trusted. Channel is a closed enum; a value outside it is treated as a
+ * customer channel here (fail closed) rather than as trusted.
  */
 const STAFF_CHANNELS: ReadonlySet<string> = new Set([Channel.DASHBOARD, Channel.API]);
 
@@ -120,7 +121,7 @@ export function isStaffChannel(ctx: EngineContext): boolean {
 
 /** Dashboard-only (staff) operations are refused on customer channels before any input is read or SQL runs. */
 export function requireStaff(ctx: EngineContext): void {
-  if (!isStaffChannel(ctx)) throw new AppError(ErrorCode.FORBIDDEN, "This action is not available on this channel.");
+  if (!isStaffChannel(ctx)) throw new AppError(ErrorCode.FORBIDDEN, "This action is not available on this channel.", { reason: "CHANNEL_NOT_ALLOWED" });
 }
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

@@ -11,7 +11,7 @@ import {
   createResource, getBusinessProfileForChannel, updateResource, listCommunications,
 } from "../src/index.ts";
 import { mapPgError } from "../src/common.ts";
-import { NOW, at, call, connectTestDb, insertBooking, insertOrder, makeCtx, rejectsWith, tx, type TestDb } from "./helpers.ts";
+import { at, call, connectTestDb, insertBooking, insertOrder, makeCtx, rejectsWith, tx, type TestDb } from "./helpers.ts";
 
 let db: TestDb;
 before(async () => {
@@ -46,7 +46,7 @@ const asChannel = (p: Pair, channel: string, subject?: { customerId?: string; co
 describe("SEC-006: customer lookup on customer channels", () => {
   test("without a verified subject nothing is found, by name, phone or e-mail, on every customer channel (the PoC)", async () => {
     const p = await seedPair("sg-nosub");
-    for (const channel of [...CUSTOMER_CHANNELS, "api", UNKNOWN_CHANNEL]) {
+    for (const channel of [...CUSTOMER_CHANNELS, UNKNOWN_CHANNEL]) {
       const ctx = asChannel(p, channel);
       const byName = await call(db, ctx, searchCustomersForAi, { name: "bh" });
       const byPhone = await call(db, ctx, searchCustomersForAi, { phone: "+919811100001" });
@@ -70,7 +70,7 @@ describe("SEC-006: customer lookup on customer channels", () => {
 
   test("with a verified subject, only that customer's own record can come back, whatever is asked", async () => {
     const p = await seedPair("sg-subject");
-    for (const channel of [...CUSTOMER_CHANNELS, "api"]) {
+    for (const channel of CUSTOMER_CHANNELS) {
       const asAlice = asChannel(p, channel, { customerId: p.alice });
       // other people: by name fragment, by phone, by e-mail, and by a mix that names both
       for (const input of [
@@ -122,11 +122,13 @@ describe("SEC-006: customer lookup on customer channels", () => {
     await rejectsWith(call(db, ctx, searchCustomersForAi, { name: "Alice", subject: { customerId: p.bob } } as never), "VALIDATION_FAILED");
   });
 
-  test("the dashboard keeps the tenant-wide minimal lookup", async () => {
+  test("trusted channels (dashboard, api) keep the tenant-wide minimal lookup; a subject there is ignored", async () => {
     const p = await seedPair("sg-dash");
-    const r = await call(db, makeCtx(p.t), searchCustomersForAi, { name: "bh" });
-    assert.deepEqual(r.customers.map((c) => c.customerId), [p.bob]);
-    assert.ok(!JSON.stringify(r).includes("+919811100002"));
+    for (const channel of ["dashboard", "api"] as const) {
+      const r = await call(db, asChannel(p, channel, { customerId: p.alice }), searchCustomersForAi, { name: "bh" });
+      assert.deepEqual(r.customers.map((c) => c.customerId), [p.bob], channel);
+      assert.ok(!JSON.stringify(r).includes("+919811100002"));
+    }
   });
 });
 
@@ -159,7 +161,8 @@ describe("staff-only functions are closed to customer channels", () => {
   test("every staff function is FORBIDDEN on web_chat, whatsapp, voice and unknown channels, before validation, SQL or any lookup", async () => {
     const t = randomUUID();
     for (const channel of [...CUSTOMER_CHANNELS, UNKNOWN_CHANNEL, "" as never, undefined as never]) {
-      const ctx = makeCtx(t, { channel });
+      const base = makeCtx(t);
+      const ctx = { ...base, actor: { ...base.actor, channel } };
       for (const [name, fn] of staffOps) {
         // valid-looking or empty input makes no difference: the refusal comes first, so an id probe learns nothing
         for (const input of [{}, { customerId: randomUUID() }, null]) {
@@ -223,8 +226,9 @@ describe("subject-bound writes a channel may make", () => {
     // repeats inside 30 minutes return the open task, a different customer gets their own, later ones are new (SEC-014)
     assert.equal((await call(db, ctx, createFollowUp, { title: "Call me back again" })).id, first.id);
     assert.notEqual((await call(db, asChannel(p, "whatsapp", { customerId: p.bob }), createFollowUp, { title: "Bob" })).id, first.id);
-    const later = makeCtx(p.t, { channel: "whatsapp" as never, kind: "api_credential" as never, now: new Date(NOW.getTime() + 31 * 60_000), subject: { customerId: p.alice } });
-    assert.notEqual((await call(db, later, createFollowUp, { title: "Still waiting" })).id, first.id);
+    // the window runs on the database clock: age the open task past 30 minutes
+    await tx(db, p.t, (c) => c.query("update follow_up_tasks set created_at = now() - interval '31 minutes' where tenant_id = $1 and id = $2", [p.t, first.id]));
+    assert.notEqual((await call(db, ctx, createFollowUp, { title: "Still waiting" })).id, first.id);
     const open = await call(db, makeCtx(p.t), listFollowUps, { customerId: p.alice });
     assert.equal(open.items.length, 2);
   });
@@ -232,10 +236,10 @@ describe("subject-bound writes a channel may make", () => {
   test("staff escalations are untouched: no dedupe, free origin and assignment", async () => {
     const p = await seedPair("sg-staff-fu");
     const staff = makeCtx(p.t);
-    const a = await call(db, staff, createFollowUp, { title: "Same", customerId: p.alice });
-    const b = await call(db, staff, createFollowUp, { title: "Same", customerId: p.alice });
-    assert.notEqual(a.id, b.id);
-    assert.equal(a.origin, "staff");
+    const a = await call(db, staff, createFollowUp, { title: "Same", customerId: p.alice, origin: "ai_escalation" });
+    const b = await call(db, staff, createFollowUp, { title: "Same", customerId: p.alice, origin: "ai_escalation", dueAt: "2031-02-01T00:00:00Z" });
+    assert.notEqual(a.id, b.id, "no dedupe for staff");
+    assert.equal(b.dueAt, "2031-02-01T00:00:00.000Z");
   });
 
   test("logCommunication is bound to the subject's own customer, booking, order and conversation", async () => {
@@ -270,8 +274,8 @@ describe("getCatalogueForChannel is strictly AI-safe", () => {
     await call(db, staff, createCatalogueItem, { kind: "product", name: "Sold out", amountPaise: 100, available: false });
     for (const channel of CUSTOMER_CHANNELS) {
       const r = await call(db, makeCtx(t, { channel }), getCatalogueForChannel, {});
-      assert.deepEqual(r.items.map((i) => i.name), ["Haircut", "Sold out"], channel);
-      const hair = r.items[0]!;
+      assert.deepEqual(r.items.map((i) => i.name), ["Sold out", "Haircut"], channel); // sortOrder 0 before 1
+      const hair = r.items.find((i) => i.name === "Haircut")!;
       assert.deepEqual(Object.keys(hair).sort(), ["amountPaise", "available", "catalogueItemId", "category", "currency", "description", "durationMinutes", "kind", "name", "variants"]);
       assert.deepEqual(Object.keys(hair.variants![0]!).sort(), ["amountPaise", "durationMinutes", "name", "variantId"]);
       assert.deepEqual(hair.variants!.map((v) => v.name), ["Long hair"]);
@@ -351,7 +355,18 @@ describe("input caps, escaping and prototype pollution", () => {
     const customer = (await call(db, staff, createCustomer, { name: "P" })).customer;
     const item = await call(db, staff, createCatalogueItem, { kind: "product", name: "P", amountPaise: 1 });
     const resource = await call(db, staff, createResource, { type: "staff", name: "P" });
-    for (const attributes of [evil, evilScalar, { constructor: { prototype: { polluted: "yes" } } }, { "prototype.polluted": "yes" }, { polluted: { nested: 1 } }]) {
+    // `__proto__` as an own key (what JSON.parse produces) is dropped by the schema: never stored, never merged into a prototype
+    for (const attributes of [evil, evilScalar]) {
+      const c = (await call(db, staff, createCustomer, { name: "Q", attributes } as never)).customer;
+      assert.deepEqual(c.attributes, {});
+      assert.equal(Object.getPrototypeOf(c.attributes), Object.prototype);
+      const r = await call(db, staff, updateResource, { resourceId: resource.id, attributes } as never);
+      assert.deepEqual(r.attributes, {});
+      const raw = await tx(db, t, async (cl) => (await cl.query<{ a: string }>("select attributes::text as a from customers where tenant_id = $1 and id = $2", [t, c.id])).rows[0]!.a);
+      assert.ok(!raw.includes("__proto__") && !raw.includes("polluted"), raw);
+    }
+    // everything else that is not a plain key with a scalar value is refused
+    for (const attributes of [{ constructor: { prototype: { polluted: "yes" } } }, { "prototype.polluted": "yes" }, { polluted: { nested: 1 } }, { _private: "x" }]) {
       await rejectsWith(call(db, staff, createCustomer, { name: "Q", attributes } as never), "VALIDATION_FAILED");
       await rejectsWith(call(db, staff, engine.updateCustomer, { customerId: customer.id, attributes } as never), "VALIDATION_FAILED");
       await rejectsWith(call(db, staff, createCatalogueItem, { kind: "product", name: "Q", amountPaise: 1, attributes } as never), "VALIDATION_FAILED");

@@ -155,6 +155,7 @@ async function loadFollowUp(sql: SqlClient, ctx: EngineContext, id: string): Pro
 
 const ESCALATION_WINDOW_MS = 30 * 60_000;
 
+// The window is measured on the database clock, the same clock that stamps follow_up_tasks.created_at.
 /** Create a follow-up. Origin defaults from the actor (user: staff, API credential: ai_escalation, system: system). */
 export const createFollowUp = op(
   z
@@ -180,9 +181,9 @@ export const createFollowUp = op(
       }
       const recent = await sql.query<{ id: string }>(
         `select id from follow_up_tasks
-          where tenant_id = $1 and customer_id = $2 and origin = $3 and status = $4 and created_at > $5
+          where tenant_id = $1 and customer_id = $2 and origin = $3 and status = $4 and created_at > now() - make_interval(secs => $5)
           order by created_at desc, id desc limit 1`,
-        [ctx.tenantId, subject, FollowUpOrigin.AI_ESCALATION, FollowUpStatus.OPEN, new Date(ctx.now().getTime() - ESCALATION_WINDOW_MS)],
+        [ctx.tenantId, subject, FollowUpOrigin.AI_ESCALATION, FollowUpStatus.OPEN, ESCALATION_WINDOW_MS / 1000],
       );
       if (recent.rows[0]) return loadFollowUp(sql, ctx, recent.rows[0].id);
       input = { ...input, customerId: subject, origin: FollowUpOrigin.AI_ESCALATION };

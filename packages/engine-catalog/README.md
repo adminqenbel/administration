@@ -18,6 +18,22 @@ Rules every function follows:
 - Money is integer paise (a decimal or string is refused); tax is basis points.
 - Lists page with `{ items, nextCursor }`, `limit` 1 to 100 (default 25) and an opaque `cursor`. Cursors carry values only,
   which reach SQL as parameters; a malformed cursor is `VALIDATION_FAILED`.
+- **Channels (security review SEC-006).** Same split as engine-bookings and engine-orders: `web_chat`, `whatsapp`, `voice`
+  are customer channels; `dashboard` and `api` are trusted (the API enforces their permissions). A value outside the
+  `Channel` enum is treated as a customer channel. Every function is staff-only (`staffOp`: `FORBIDDEN`,
+  `details.reason = "CHANNEL_NOT_ALLOWED"`, before input validation or SQL, so an id probe learns nothing) except these six:
+  `searchCustomersForAi`, `getCatalogueForChannel`, `getBusinessProfileForChannel`, `loadAvailabilityInputs`,
+  `createFollowUp`, `logCommunication`. A test walks every export and fails if a new one is not classified.
+  - `searchCustomersForAi` on a customer channel is not a lookup: it only confirms `ctx.subject.customerId` (set by the
+    channel layer from the verified contact). All given filters must match that one record and the only possible result
+    is its own minimal summary. No subject (or a malformed one), archived subject, other tenant, or a miss: the same
+    `{ customers: [] }`, and with no subject no SQL runs. On trusted channels it is the tenant-wide minimal lookup.
+  - `createFollowUp` / `logCommunication` on a customer channel need a subject; `customerId`, `bookingId`, `orderId` and
+    `conversationId` must belong to it (else `NOT_FOUND`); the follow-up is always `ai_escalation` about the subject, cannot
+    assign staff or set a due time, and a repeat within 30 minutes (database clock) returns the open task (SEC-014).
+- Postgres constraint names are never put in error `details` (SEC-022); the contact unique indexes give `details.field`.
+- `attributes` keys must match `^[A-Za-z][A-Za-z0-9_]{0,39}$` with scalar values; an own `__proto__` key (as `JSON.parse`
+  makes) is dropped by the schema and never stored. There is no deep merge.
 - Only `createCustomer` emits an event (`customer.created`, once, only when a row is created, payload with masked contact).
   The webhook list has no other event for this package. Audit log rows are the API layer's job.
 
@@ -49,7 +65,7 @@ Rules every function follows:
   engine call that meets those two constraints maps to `CONFLICT` with `details.field` and no database text.
 - **Phone.** `normalisePhone` accepts `+`/`00` international numbers and, for India, bare 10 digit mobiles (6-9), with `0` or `91`
   in front. Anything it cannot place safely is refused, not guessed.
-- **AI-safe reads.** `searchCustomersForAi`: id, first name, masked phone and email, `hasUpcomingBooking`, at most 5, needs a filter.
+- **AI-safe reads.** `searchCustomersForAi`: id, first name, masked phone and email, `hasUpcomingBooking`, at most 5, needs a filter (customer channels: the subject only, see above).
   `getCatalogueForChannel`: id, name, kind, description (cut at 1000), category name, price, currency, duration, available, active
   variants; never archived items, inactive categories, SKU, tax, buffer, attributes. `getBusinessProfileForChannel`: only
   whitelisted settings keys and active locations.

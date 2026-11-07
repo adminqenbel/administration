@@ -175,13 +175,16 @@ export const updateLocation = staffOp(
 
 export const getLocation = staffOp(z.object({ locationId: idArg }).strict(), (sql, ctx, input) => loadLocation(sql, ctx, input.locationId));
 
-export const listLocations = staffOp(z.object({ includeArchived: z.boolean().default(false) }).strict(), async (sql, ctx, input): Promise<LocationDto[]> => {
+/** Internal reader shared by the staff list and the channel profile (which must not go through the staff gate). */
+async function readLocations(sql: SqlClient, ctx: EngineContext, includeArchived: boolean): Promise<LocationDto[]> {
   const res = await sql.query<LocationRow>(
     `select ${LOCATION_COLS} from locations where tenant_id = $1 and ($2::boolean or active) order by is_default desc, lower(name), id limit 200`,
-    [ctx.tenantId, input.includeArchived],
+    [ctx.tenantId, includeArchived],
   );
   return res.rows.map(toLocation);
-});
+}
+
+export const listLocations = staffOp(z.object({ includeArchived: z.boolean().default(false) }).strict(), (sql, ctx, input) => readLocations(sql, ctx, input.includeArchived));
 
 /** Soft delete (`active = false`). Refused for the default location, and while live bookings are still to come there. */
 export const archiveLocation = staffOp(z.object({ locationId: idArg }).strict(), async (sql, ctx, input): Promise<LocationDto> => {
@@ -454,7 +457,7 @@ async function loadTenant(sql: SqlClient, ctx: EngineContext): Promise<TenantRow
 }
 
 async function locationsWithHours(sql: SqlClient, ctx: EngineContext, includeArchived: boolean) {
-  const locs = await listLocations(sql, ctx, { includeArchived });
+  const locs = await readLocations(sql, ctx, includeArchived);
   const hours = await sql.query<HourRow & { location_id: string }>(
     "select location_id, weekday, open_time::text as s, close_time::text as e from business_hours where tenant_id = $1 order by weekday, open_time",
     [ctx.tenantId],
