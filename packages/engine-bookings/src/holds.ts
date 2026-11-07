@@ -11,7 +11,7 @@ import { loadConfig, type BookingConfig, type EngineOptions } from "./config.ts"
 import { BookingAuditAction, recordChange } from "./events.ts";
 import { withIdempotency } from "./idempotency.ts";
 import { insertAllocations, loadBooking, lockResources, toView } from "./repo.ts";
-import { createHoldInputSchema, parseOrThrow } from "./schemas.ts";
+import { createHoldInputSchema, parseOrThrow, type CreateHoldInput } from "./schemas.ts";
 import { bufferFor, loadService } from "./service.ts";
 import { sqlAvailabilityDataSource } from "./sql-source.ts";
 import type { WriteResult } from "./types.ts";
@@ -129,7 +129,7 @@ interface HoldPlan {
   startMs: number;
   endMs: number;
   bufferMinutes: number;
-  input: ReturnType<typeof createHoldInputSchema.parse>;
+  input: CreateHoldInput;
   serviceId: string | null;
   currency: string;
 }

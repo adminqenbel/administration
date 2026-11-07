@@ -9,6 +9,7 @@ const SECRET_KEY = /authorization|cookie|token|secret|password|passwd|pepper|api
 const REDACTED = "[redacted]";
 
 const SCRUBBERS: Array<[RegExp, string]> = [
+  [/\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1=[redacted]"],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]"],
   [/\bqbk_[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})?/g, "qbk_[redacted]"],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, "[redacted-jwt]"],

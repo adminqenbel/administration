@@ -1,16 +1,17 @@
 import "reflect-metadata";
-import { json } from "express";
+import { json, type NextFunction, type Request, type Response } from "express";
 import { NestFactory } from "@nestjs/core";
 import type { LoggerService, Provider, Type } from "@nestjs/common";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { createPool, type Pool } from "@qenbel/db";
-import { AuthProviderKind } from "@qenbel/shared";
+import { AppError, AuthProviderKind, ErrorCode, toErrorBody } from "@qenbel/shared";
+import { normalizeError } from "./errors/normalize.ts";
 import { AppModule } from "./app.module.ts";
 import { createClerkProvider } from "./auth/clerk.provider.ts";
 import { createDevProvider } from "./auth/dev.provider.ts";
 import type { AuthProvider } from "./auth/auth-provider.ts";
 import { accessLog, cors, requestId, requireJsonBody, securityHeaders } from "./common/http-middleware.ts";
-import { AppLogger } from "./common/logger.ts";
+import { AppLogger, errorFields } from "./common/logger.ts";
 import { type AppConfig, assertSafeAuthConfig } from "./config/config.ts";
 import { FallbackRateLimiter, InMemoryRateLimiter, RedisRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
 
@@ -103,5 +104,16 @@ export async function createApp(options: CreateAppOptions): Promise<NestExpressA
   app.use(json({ limit: config.bodyLimitBytes, strict: true, type: "application/json" }));
   app.setGlobalPrefix(GLOBAL_PREFIX, { exclude: [...UNPREFIXED_ROUTES] });
   await app.init();
+  // Nest answers 404s and errors only under /v1. These last two handlers give every other path (and errors
+  // raised by middleware before routing, such as a malformed JSON body on /health) the same wire format.
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json(toErrorBody(new AppError(ErrorCode.NOT_FOUND)));
+  });
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    const e = normalizeError(err);
+    if (e.status >= 500) logger.error("request failed", { err: errorFields(err), code: e.code });
+    res.status(e.status).json(toErrorBody(e));
+  });
   return app;
 }

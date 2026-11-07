@@ -101,7 +101,7 @@ export class RedisRateLimiter implements RateLimiter {
     this.redis = new Redis(url, {
       lazyConnect: false,
       maxRetriesPerRequest: 1,
-      enableOfflineQueue: false,
+      enableOfflineQueue: true, // commands wait for the connection; commandTimeout bounds the wait
       connectTimeout: 2_000,
       commandTimeout: 1_000,
       retryStrategy: (times) => Math.min(times * 200, 2_000),

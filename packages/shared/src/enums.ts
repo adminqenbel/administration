@@ -108,12 +108,15 @@ export const WebhookEvent = {
   BOOKING_CANCELLED: "booking.cancelled",
   BOOKING_NO_SHOW: "booking.no_show",
   BOOKING_COMPLETED: "booking.completed",
+  BOOKING_EXPIRED: "booking.expired",
   ORDER_CREATED: "order.created",
   ORDER_ACCEPTED: "order.accepted",
   ORDER_FULFILLED: "order.fulfilled",
   ORDER_CANCELLED: "order.cancelled",
+  ORDER_REJECTED: "order.rejected",
   CUSTOMER_CREATED: "customer.created",
   PAYMENT_COMPLETED: "payment.completed",
+  PAYMENT_REFUNDED: "payment.refunded",
 } as const;
 export type WebhookEvent = (typeof WebhookEvent)[keyof typeof WebhookEvent];
 

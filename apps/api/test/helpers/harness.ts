@@ -95,7 +95,8 @@ export async function startApp(db: Db, options: StartOptions = {}): Promise<Test
   const logs = new MemorySink();
   const logger = options.logger ?? new AppLogger("debug", logs);
   const limiter = options.limiter ?? new InMemoryRateLimiter();
-  const app = await createApp({ ...options, config, logger, pool: db.app, limiter });
+  const app = await createApp({ ...options, config, logger, pool: options.pool ?? db.app, limiter });
+  await app.listen(0, "127.0.0.1");
   const http = request(app.getHttpServer());
   const auth = (t: request.Test, token?: string) => (token ? t.set("Authorization", `Bearer ${token}`) : t);
   return {
