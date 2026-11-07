@@ -21,9 +21,10 @@ CREATE ROLE qenbel_platform NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRL
 GRANT qenbel_platform TO qenbel_migrate WITH INHERIT FALSE, SET TRUE;
 CREATE DATABASE qenbel_admin      OWNER qenbel_migrate;
 CREATE DATABASE qenbel_admin_test OWNER qenbel_migrate;
+CREATE DATABASE qenbel_admin_api_test OWNER qenbel_migrate;
 SQL
 
-for db in qenbel_admin qenbel_admin_test; do
+for db in qenbel_admin qenbel_admin_test qenbel_admin_api_test; do
   psql -v ON_ERROR_STOP=1 --username postgres --dbname "$db" <<SQL
 REVOKE CONNECT ON DATABASE $db FROM PUBLIC;
 GRANT CONNECT ON DATABASE $db TO qenbel_migrate, qenbel_app;
