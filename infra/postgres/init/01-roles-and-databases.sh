@@ -6,6 +6,8 @@
 #   qenbel_app       runtime role. LOGIN, NOBYPASSRLS, no ownership, DML grants only.
 #   qenbel_platform  owns a handful of SECURITY DEFINER functions (tenant creation, credential lookup,
 #                    cross-tenant hold sweep). BYPASSRLS, NOLOGIN by default. Nothing connects as it.
+# 02-app-roles.sh then adds the least-privilege login roles qenbel_auth and qenbel_platform_ops (SEC-002); it is also
+# what infra/postgres/apply-roles.sh runs against an existing container.
 set -eu
 
 APP_PW="${QENBEL_APP_PASSWORD:-$POSTGRES_PASSWORD}"

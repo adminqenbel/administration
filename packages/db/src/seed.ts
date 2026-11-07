@@ -13,6 +13,8 @@ export const RESTAURANT_TENANT_ID = "a0000000-0000-4000-8000-000000000002";
 export interface SeedOptions {
   /** Pool as qenbel_app. Required. */
   appPool: Pool;
+  /** Pool as qenbel_platform_ops (DATABASE_PLATFORM_URL). Creates the demo tenants (migration 017: the app role cannot). */
+  platformPool: Pool;
   /** Pool as qenbel_migrate. Needed for `reset` and for the dev platform admin. */
   migratePool?: Pool;
   /** Truncate all tenant data first (local development databases only). */
@@ -233,7 +235,7 @@ export async function seed(options: SeedOptions): Promise<SeedSummary> {
   for (const def of defs) {
     const exists = await withTenant(appPool, def.id, async (c) => (await c.query("select 1 from tenants where id = $1", [def.id])).rowCount === 1);
     if (!exists) {
-      await appPool.query("select platform_create_tenant($1, $2, 'central', $3, '1.0.0', 'Asia/Kolkata', $4)", [def.slug, def.name, def.pack, def.id]);
+      await options.platformPool.query("select platform_create_tenant($1, $2, 'central', $3, '1.0.0', 'Asia/Kolkata', $4)", [def.slug, def.name, def.pack, def.id]);
     }
     const alreadySeeded = await withTenant(appPool, def.id, async (c) => ((await c.query("select count(*)::int as n from locations")).rows[0] as { n: number }).n > 0);
     if (alreadySeeded) {

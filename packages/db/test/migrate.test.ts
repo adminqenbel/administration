@@ -3,7 +3,7 @@ import { cp, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { DEFAULT_MIGRATIONS_DIR, loadMigrations, runMigrations } from "../src/index.ts";
+import { loadMigrations, migrationsDir, runMigrations } from "../src/index.ts";
 import { connectTestDb, type TestDb } from "./helpers.ts";
 
 let db: TestDb;
@@ -24,7 +24,7 @@ describe("migration runner", () => {
 
   it("records every file in schema_migrations, in order", async () => {
     const rows = (await db.owner.query<{ name: string }>("select name from schema_migrations order by name")).rows.map((r) => r.name);
-    const files = (await readdir(DEFAULT_MIGRATIONS_DIR)).filter((n) => n.endsWith(".sql")).sort();
+    const files = (await readdir(migrationsDir())).filter((n) => n.endsWith(".sql")).sort();
     assert.deepEqual(rows, files);
   });
 
@@ -36,7 +36,7 @@ describe("migration runner", () => {
   it("refuses a migration that was edited after it was applied", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "qenbel-mig-"));
     try {
-      await cp(DEFAULT_MIGRATIONS_DIR, dir, { recursive: true });
+      await cp(migrationsDir(), dir, { recursive: true });
       const target = path.join(dir, "002_platform.sql");
       await writeFile(target, `${await readFile(target, "utf8")}\n-- edited\n`);
       await assert.rejects(runMigrations(db.owner, { dir }), /changed after it was applied/);
@@ -48,7 +48,7 @@ describe("migration runner", () => {
   it("rolls back a failing migration completely and does not record it", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "qenbel-mig-"));
     try {
-      await cp(DEFAULT_MIGRATIONS_DIR, dir, { recursive: true });
+      await cp(migrationsDir(), dir, { recursive: true });
       await writeFile(path.join(dir, "999_broken.sql"), "create table should_be_rolled_back (id int);\nselect 1/0;\n");
       await assert.rejects(runMigrations(db.owner, { dir }), /999_broken.sql failed/);
       const t = await db.owner.query("select to_regclass('public.should_be_rolled_back') as t");

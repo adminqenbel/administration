@@ -72,23 +72,33 @@ export function resolveDatabaseUrls(database: string = DEV_DATABASE, env: NodeJS
   const build = (user: string, pw: string) =>
     `postgres://${user}:${encodeURIComponent(pw)}@${host}:${port}/${database}`;
   const appUrl = explicitApp ?? build("qenbel_app", appPw as string);
-  const sibling = (user: string, pw: string | undefined): string | null => {
-    if (!pw) return null;
-    try {
-      const u = new URL(appUrl);
-      u.username = user;
-      u.password = pw; // the setter percent-encodes
-      return u.toString();
-    } catch {
-      return null;
-    }
-  };
   return {
     appUrl,
     migrateUrl: explicitMigrate ?? build("qenbel_migrate", migPw as string),
-    authUrl: explicitAuth ?? sibling("qenbel_auth", process.env.QENBEL_AUTH_PASSWORD || base),
-    platformUrl: explicitPlatform ?? sibling("qenbel_platform_ops", process.env.QENBEL_PLATFORM_OPS_PASSWORD || base),
+    authUrl: explicitAuth || deriveRoleUrl(appUrl, "qenbel_auth"),
+    platformUrl: explicitPlatform || deriveRoleUrl(appUrl, "qenbel_platform_ops"),
   };
+}
+
+export type LeastPrivilegeRole = "qenbel_auth" | "qenbel_platform_ops";
+
+/**
+ * The same host, port and database as `appUrl`, logging in as one of the least-privilege roles with its own password
+ * (QENBEL_AUTH_PASSWORD / QENBEL_PLATFORM_OPS_PASSWORD, else the local development POSTGRES_PASSWORD from infra/.env).
+ * Null when no password is available.
+ */
+export function deriveRoleUrl(appUrl: string, role: LeastPrivilegeRole, env: NodeJS.ProcessEnv = process.env): string | null {
+  loadInfraEnv(env);
+  const pw = (role === "qenbel_auth" ? process.env.QENBEL_AUTH_PASSWORD : process.env.QENBEL_PLATFORM_OPS_PASSWORD) || process.env.POSTGRES_PASSWORD;
+  if (!pw) return null;
+  try {
+    const u = new URL(appUrl);
+    u.username = role;
+    u.password = pw; // the setter percent-encodes
+    return u.toString();
+  } catch {
+    return null;
+  }
 }
 
 /** Like resolveDatabaseUrls but throws a clear error when the least-privilege URLs cannot be derived. */

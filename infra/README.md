@@ -21,12 +21,14 @@ All ports are bound to `127.0.0.1`. The QenBel portal uses 5432/5434, so these p
    MINIO_ROOT_PASSWORD=...        # MinIO needs at least 8 characters
    ```
 
-   Optional: `QENBEL_APP_PASSWORD`, `QENBEL_MIGRATE_PASSWORD` (default to `POSTGRES_PASSWORD`).
+   Optional: `QENBEL_APP_PASSWORD`, `QENBEL_MIGRATE_PASSWORD`, `QENBEL_AUTH_PASSWORD`, `QENBEL_PLATFORM_OPS_PASSWORD` (default to `POSTGRES_PASSWORD`,
+   local development only; `QENBEL_REQUIRE_DISTINCT_PASSWORDS=1` makes the last two mandatory).
 
 2. From the repo root:
 
    ```
    docker compose -f infra/docker-compose.yml up -d
+   sh infra/postgres/apply-roles.sh          # existing volumes only; a new volume gets the roles from init/02
    npm run migrate -w @qenbel/db
    npm run seed -w @qenbel/db
    ```
@@ -44,7 +46,25 @@ superuser. It creates:
 - `qenbel_app`: runtime role. `NOBYPASSRLS`, owns nothing, only the grants in migration 011.
 - `qenbel_platform`: `NOLOGIN`, `BYPASSRLS`. Owns a few `SECURITY DEFINER` functions. Nothing connects as it.
 
-If you change the init script or the passwords after the first start, remove the volume
+Then `infra/postgres/init/02-app-roles.sh` adds the least-privilege login roles (SEC-002 in `docs/security/REVIEW-stage2.md`):
+
+- `qenbel_auth`: executes only `auth_lookup_user`, `auth_lookup_credential`, `auth_is_platform_admin`. No table privilege. For the authentication lookups.
+- `qenbel_platform_ops`: executes only the `platform_*` functions, `expire_booking_holds()` and `purge_expired_idempotency_keys()`. No table privilege.
+  For the platform controller and the background jobs.
+
+The init scripts run only on the first start of an empty volume. For an existing volume run, as often as you like:
+
+```
+sh infra/postgres/apply-roles.sh                     # qenbel_admin, qenbel_admin_test, qenbel_admin_api_test
+sh infra/postgres/apply-roles.sh my_scratch_test     # or only the databases you name
+```
+
+It runs `02-app-roles.sh` inside the container as the superuser (`docker exec`; `QENBEL_DB_CONTAINER` overrides the name,
+`QENBEL_APPLY_ROLES_LOCAL=1` uses your own `psql` and `PG*` variables instead). It creates or updates the two roles (attributes, password,
+timeouts), grants `CONNECT` and schema `USAGE`, and refuses if any QenBel login role has a role membership. Function grants are made by
+migration 017, so run the migrations afterwards. Passwords are passed by name, never on the command line.
+
+If you change `01-roles-and-databases.sh` or its passwords after the first start, remove the volume
 (`docker compose -f infra/docker-compose.yml down -v`) so it runs again.
 
 Connection URLs, if you want to set them yourself (the db package builds them from `infra/.env` when unset):
@@ -52,6 +72,8 @@ Connection URLs, if you want to set them yourself (the db package builds them fr
 ```
 DATABASE_URL=postgres://qenbel_app:<password>@localhost:54329/qenbel_admin
 DATABASE_MIGRATE_URL=postgres://qenbel_migrate:<password>@localhost:54329/qenbel_admin
+DATABASE_AUTH_URL=postgres://qenbel_auth:<password>@localhost:54329/qenbel_admin
+DATABASE_PLATFORM_URL=postgres://qenbel_platform_ops:<password>@localhost:54329/qenbel_admin
 ```
 
 ## Notes

@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, test } from "node:test";
-import { createPool, resolveDatabaseUrls, runMigrations, withTenant, type Pool, type PoolClient } from "@qenbel/db";
+import { createPool, createTestTenant, resolveDatabaseUrls, runMigrations, withTenant, type Pool, type PoolClient } from "@qenbel/db";
 import { cancelBooking, confirmBooking, createHold, rescheduleBooking } from "@qenbel/engine-bookings";
 import { searchCustomersForAi } from "@qenbel/engine-catalog";
 import { applyDiscount, cancelOrder, createOrderDraft, placeOrder, recordPayment, recordRefund } from "@qenbel/engine-orders";
@@ -48,12 +48,8 @@ async function insert(c: PoolClient, table: string, row: Record<string, unknown>
 }
 
 async function mkTenant(pack: string, label: string): Promise<string> {
-  const r = await app.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', $3, '1.0.0') as id", [
-    `sec-${label}-${randomUUID().slice(0, 8)}`,
-    `Sec ${label}`,
-    pack,
-  ]);
-  return (r.rows[0] as { id: string }).id;
+  // Since migration 017 only qenbel_platform_ops may create tenants (SEC-002).
+  return createTestTenant(app, { slug: `sec-${label}-${randomUUID().slice(0, 8)}`, name: `Sec ${label}`, packId: pack });
 }
 
 interface Salon {
@@ -189,15 +185,16 @@ describe("bookings: slot denial and ownership", () => {
 describe("idempotency", () => {
   test(
     "[DEFECT SEC-010] a second credential in the same tenant cannot receive the first credential's stored result by repeating its key and body",
-    { todo: "SEC-010: idempotency rows are keyed (tenant, key, route); the principal is not part of the key or the hash" },
+    // Fixed by migration 018 once the caller passes the principal to withTenant (api-core's unit of work must do this; see
+    // docs/CONTRACT-REQUESTS.md). Without a principal both calls share the '' principal and the replay would still happen.
     async () => {
       const s = await seedSalon();
       const body = { startsAt: iso(MON_10 + 7 * 86_400_000), catalogueItemId: s.serviceId, resourceId: s.staffA };
       const key = `voice-call-4711-hold-1`;
-      const first = await tx(s.tenantId, (c) => createHold(c, ctx(s.tenantId, { actorId: "cred-voice", key }), body));
+      const first = await withTenant(app, s.tenantId, (c) => createHold(c, ctx(s.tenantId, { actorId: "cred-voice", key }), body), { principal: "credential:cred-voice" });
       let second: Awaited<ReturnType<typeof createHold>> | undefined;
       try {
-        second = await tx(s.tenantId, (c) => createHold(c, ctx(s.tenantId, { actorId: "cred-widget-attacker", channel: "web_chat", key }), body));
+        second = await withTenant(app, s.tenantId, (c) => createHold(c, ctx(s.tenantId, { actorId: "cred-widget-attacker", channel: "web_chat", key }), body), { principal: "credential:cred-widget-attacker" });
       } catch {
         second = undefined;
       }

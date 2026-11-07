@@ -105,7 +105,7 @@ describe("(e) idempotency keys", () => {
       (await c.query<{ hours: number }>("select extract(epoch from (expires_at - created_at)) / 3600 as hours from idempotency_keys where key = $1", [key])).rows[0]);
     assert.equal(Math.round(Number(row?.hours)), 24);
     await withTenant(db.app, T, (c) => c.query("update idempotency_keys set expires_at = now() - interval '1 minute' where key = $1", [key]));
-    const purged = await db.app.query<{ n: number }>("select purge_expired_idempotency_keys() as n");
+    const purged = await db.platform.query<{ n: number }>("select purge_expired_idempotency_keys() as n");
     assert.ok(Number(purged.rows[0]?.n) >= 1);
     const left = await withTenant(db.app, T, async (c) => (await c.query("select 1 from idempotency_keys where key = $1", [key])).rowCount);
     assert.equal(left, 0);

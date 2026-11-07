@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  createPool, resolveDatabaseUrls, runMigrations, TEST_DATABASE, withTenant,
+  createPool, parseTenantProofKey, requireLeastPrivilegeUrls, resolveDatabaseUrls, runMigrations, TEST_DATABASE, withTenant,
   type Pool, type PoolClient,
 } from "../src/index.ts";
 
@@ -9,6 +9,10 @@ export interface TestDb {
   app: Pool;
   /** Owner role (qenbel_migrate). Also subject to FORCE RLS. */
   owner: Pool;
+  /** qenbel_platform_ops: tenant lifecycle, cross-tenant sweep, purge (migration 017). */
+  platform: Pool;
+  /** qenbel_auth: the three auth_lookup functions only. */
+  auth: Pool;
   close(): Promise<void>;
 }
 
@@ -21,10 +25,13 @@ export async function connectTestDb(options: { max?: number } = {}): Promise<Tes
   const urls = resolveDatabaseUrls(TEST_DATABASE);
   const owner = createPool({ connectionString: urls.migrateUrl, max: 4, applicationName: "qenbel-test-owner" });
   const app = createPool({ connectionString: urls.appUrl, max: options.max ?? 8, applicationName: "qenbel-test-app" });
+  const lp = requireLeastPrivilegeUrls(urls);
+  const platform = createPool({ connectionString: lp.platformUrl, max: 4, applicationName: "qenbel-test-platform" });
+  const auth = createPool({ connectionString: lp.authUrl, max: 2, applicationName: "qenbel-test-auth" });
   try {
     await owner.query("select 1");
   } catch (err) {
-    await Promise.allSettled([owner.end(), app.end()]);
+    await Promise.allSettled([owner.end(), app.end(), platform.end(), auth.end()]);
     throw new Error(
       `Test database is not reachable (${(err as Error).message}).\n` +
       "Start it with:  docker compose -f infra/docker-compose.yml up -d   (Postgres on localhost:54329)\n" +
@@ -33,18 +40,24 @@ export async function connectTestDb(options: { max?: number } = {}): Promise<Tes
   }
   await runMigrations(owner);
   await owner.query("truncate table tenants, platform_admins cascade");
+  // SEC-003 tenant proof (migration 021): on when QENBEL_TENANT_PROOF_KEY is set for the run (withTenant reads the same variable), else off.
+  const proofHex = process.env.QENBEL_TENANT_PROOF_KEY;
+  if (proofHex) await platform.query("select platform_set_tenant_proof_keys($1)", [parseTenantProofKey(proofHex)]);
+  else await platform.query("select platform_clear_tenant_proof_keys()");
   return {
     app,
     owner,
+    platform,
+    auth,
     close: async () => {
-      await Promise.allSettled([app.end(), owner.end()]);
+      await Promise.allSettled([app.end(), owner.end(), platform.end(), auth.end()]);
     },
   };
 }
 
 export async function createTenant(db: TestDb, slugPrefix: string): Promise<string> {
   const slug = `${slugPrefix}-${randomUUID().slice(0, 8)}`;
-  const res = await db.app.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Test ${slug}`]);
+  const res = await db.platform.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Test ${slug}`]);
   return (res.rows[0] as { id: string }).id;
 }
 

@@ -16,6 +16,10 @@ services:
       QENBEL_APP_PASSWORD: ${QENBEL_APP_PASSWORD:-}
       QENBEL_MIGRATE_PASSWORD: ${QENBEL_MIGRATE_PASSWORD:-}
       QENBEL_PLATFORM_PASSWORD: ${QENBEL_PLATFORM_PASSWORD:-}
+      # Least-privilege login roles, read by init/02-app-roles.sh on first start (apply-roles.sh passes them for a running container).
+      QENBEL_AUTH_PASSWORD: ${QENBEL_AUTH_PASSWORD:-}
+      QENBEL_PLATFORM_OPS_PASSWORD: ${QENBEL_PLATFORM_OPS_PASSWORD:-}
+      QENBEL_REQUIRE_DISTINCT_PASSWORDS: ${QENBEL_REQUIRE_DISTINCT_PASSWORDS:-0}
     ports:
       - "127.0.0.1:54329:5432"
     volumes:

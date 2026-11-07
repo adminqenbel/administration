@@ -218,15 +218,15 @@ describe("targeted isolation behaviours", () => {
   });
 
   it("platform functions are the only cross-tenant path: credential lookup returns the owning tenant", async () => {
-    const res = await db.app.query<{ tenant_id: string }>("select tenant_id from auth_lookup_credential($1)", [
+    const res = await db.auth.query<{ tenant_id: string }>("select tenant_id from auth_lookup_credential($1)", [
       (await withTenant(db.app, B, async (c) => (await c.query<{ lookup_id: string }>("select lookup_id from api_credentials")).rows[0]?.lookup_id)) as string,
     ]);
     assert.equal(res.rows[0]?.tenant_id, B);
-    const missing = await db.app.query("select * from auth_lookup_credential('nope-nope-nope')");
+    const missing = await db.auth.query("select * from auth_lookup_credential('nope-nope-nope')");
     assert.equal(missing.rowCount, 0);
-    const users = await db.app.query<{ tenant_id: string }>("select tenant_id from auth_lookup_user('dev', 'dev|nobody')");
+    const users = await db.auth.query<{ tenant_id: string }>("select tenant_id from auth_lookup_user('dev', 'dev|nobody')");
     assert.equal(users.rowCount, 0);
-    const admin = await db.app.query<{ ok: boolean }>("select auth_is_platform_admin('dev', 'dev|nobody') as ok");
+    const admin = await db.auth.query<{ ok: boolean }>("select auth_is_platform_admin('dev', 'dev|nobody') as ok");
     assert.equal(admin.rows[0]?.ok, false);
   });
 

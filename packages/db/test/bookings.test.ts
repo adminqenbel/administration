@@ -191,7 +191,7 @@ describe("hold expiry releases the slot", () => {
     const holdA = await bookSlot(db, tA, { resourceId: fA.resources[0] as string, locationId: fA.location, customerId: fA.customer, from: 0, to: 30, status: "HOLD", holdExpiresAt: past });
     const liveA = await bookSlot(db, tA, { resourceId: fA.resources[1] as string, locationId: fA.location, customerId: fA.customer, from: 0, to: 30, status: "HOLD", holdExpiresAt: new Date(Date.now() + 600_000) });
     const holdB = await bookSlot(db, tB, { resourceId: fB.resources[0] as string, locationId: fB.location, customerId: fB.customer, from: 0, to: 30, status: "HOLD", holdExpiresAt: past });
-    const n = await expireBookingHolds(db.app);
+    const n = await expireBookingHolds(db.platform);
     assert.ok(n >= 2, `expected at least 2 expired, got ${n}`);
     const status = (tenant: string, id: string) =>
       withTenant(db.app, tenant, async (c) => (await c.query<{ status: string }>("select status from bookings where id = $1", [id])).rows[0]?.status);

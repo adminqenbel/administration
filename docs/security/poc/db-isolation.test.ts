@@ -13,7 +13,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, test } from "node:test";
-import { createPool, resolveDatabaseUrls, runMigrations, withTenant, type Pool } from "@qenbel/db";
+import { randomBytes } from "node:crypto";
+import {
+  configureTenantProof, createPool, createTestTenant, resolveDatabaseUrls, runMigrations, setTestTenantStatus, withTenant,
+  withTestAuthClient, withTestPlatformClient, type Pool,
+} from "@qenbel/db";
 
 const SCRATCH = "qenbel_admin_sec_test";
 // Never let a stray environment variable point these tests at another database.
@@ -29,8 +33,7 @@ let credB = "";
 
 async function mkTenant(label: string): Promise<string> {
   const slug = `sec-${label}-${randomUUID().slice(0, 8)}`;
-  const r = await app.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', 'salon', '1.0.0') as id", [slug, `Sec ${slug}`]);
-  return (r.rows[0] as { id: string }).id;
+  return createTestTenant(app, { slug, name: `Sec ${slug}` });
 }
 
 before(async () => {
@@ -40,6 +43,11 @@ before(async () => {
   const who = await owner.query<{ db: string }>("select current_database() as db");
   assert.equal(who.rows[0]?.db, SCRATCH, "refusing to run: not the scratch database");
   await runMigrations(owner);
+  // SEC-003 mitigation (migration 021): this scratch database runs with the signed tenant context switched on, the way
+  // a production database is meant to. withTenant() signs app.tenant_id with the same key.
+  const proofKey = randomBytes(32);
+  await withTestPlatformClient(app, (c) => c.query("select platform_set_tenant_proof_keys($1)", [proofKey]));
+  configureTenantProof(proofKey);
 
   tenantA = await mkTenant("a");
   tenantB = await mkTenant("b");
@@ -60,6 +68,7 @@ before(async () => {
 });
 
 after(async () => {
+  await withTestPlatformClient(app, (c) => c.query("select platform_clear_tenant_proof_keys()")).catch(() => undefined);
   await Promise.allSettled([app?.end(), owner?.end()]);
 });
 
@@ -171,23 +180,24 @@ describe("SECURITY DEFINER functions", () => {
 
   test(
     "[DEFECT SEC-001] SECURITY DEFINER functions are not executable by PUBLIC (the REVOKE in migration 011 is a silent no-op)",
-    { todo: "SEC-001: REVOKE/GRANT ran after ALTER FUNCTION OWNER TO qenbel_platform, as a role without grant option; ACL still shows =X/qenbel_platform" },
+    // Fixed by migration 017. current_tenant_id() is the one deliberate PUBLIC function (every policy calls it); since 021 it is a
+    // definer so it can read the tenant-proof key, and it only ever returns the caller's own, verified tenant.
     async () => {
       const res = await owner.query<{ fn: string }>(
         `select p.oid::regprocedure::text as fn
            from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-          where n.nspname = 'public' and p.prosecdef
+          where n.nspname = 'public' and p.prosecdef and p.proname <> 'current_tenant_id'
             and exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where a.grantee = 0 and a.privilege_type = 'EXECUTE')`,
       );
       assert.deepEqual(res.rows.map((r) => r.fn), [], "PUBLIC can execute these SECURITY DEFINER functions");
     },
   );
 
-  test("[GUARD] non-definer helper functions in schema public: only current_tenant_id() is PUBLIC-executable", async () => {
+  test("[GUARD] functions in schema public: only current_tenant_id() is PUBLIC-executable", async () => {
     const res = await owner.query<{ fn: string }>(
       `select p.oid::regprocedure::text as fn
          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-        where n.nspname = 'public' and p.prokind = 'f' and not p.prosecdef and p.prorettype <> 'trigger'::regtype
+        where n.nspname = 'public' and p.prokind = 'f'
           and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
           and exists (select 1 from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where a.grantee = 0 and a.privilege_type = 'EXECUTE')`,
     );
@@ -198,7 +208,7 @@ describe("SECURITY DEFINER functions", () => {
 
   test(
     "[DEFECT SEC-002] code running as qenbel_app inside tenant A cannot suspend tenant B",
-    { todo: "SEC-002: platform_set_tenant_status is EXECUTE-granted to the runtime role" },
+    // Fixed by migration 017 (no EXECUTE for qenbel_app).
     async () => {
       try {
         let suspended = false;
@@ -210,14 +220,14 @@ describe("SECURITY DEFINER functions", () => {
         }
         assert.equal(suspended, false, "tenant A's session suspended tenant B through platform_set_tenant_status()");
       } finally {
-        await app.query("select platform_set_tenant_status($1, 'active')", [tenantB]);
+        await setTestTenantStatus(app, tenantB, "active");
       }
     },
   );
 
   test(
     "[DEFECT SEC-002] code running as qenbel_app inside tenant A cannot expire tenant B's holds by passing a future 'now'",
-    { todo: "SEC-002: expire_booking_holds(p_now) is a cross-tenant write callable by the runtime role" },
+    // Fixed by migration 017 (no EXECUTE for qenbel_app, and the sweep no longer takes a clock).
     async () => {
       const bookingId = randomUUID();
       const resId = randomUUID();
@@ -237,7 +247,7 @@ describe("SECURITY DEFINER functions", () => {
 
   test(
     "[DEFECT SEC-002] code running as qenbel_app inside tenant A cannot read tenant B's API key hash",
-    { todo: "SEC-002: auth_lookup_credential() returns secret_hash to any caller holding the lookup id" },
+    // Fixed by migration 017 (only qenbel_auth may execute it).
     async () => {
       const lookup = (await owner.query<{ lookup_id: string }>("select lookup_id from api_credentials where id = $1", [credB])).rows[0]?.lookup_id;
       // 'owner' is subject to FORCE RLS and sees nothing, so read the lookup id the way the test created it: from tenant B's own session.
@@ -256,7 +266,8 @@ describe("SECURITY DEFINER functions", () => {
 
   test(
     "[DEFECT SEC-003] SQL running in tenant A's transaction cannot switch to tenant B with set_config (blast radius of any SQL injection)",
-    { todo: "SEC-003: the tenant is an ordinary GUC; any statement the role can run can change it. Inherent to the pattern; see report for mitigations" },
+    // Passes with the signed tenant context of migration 021 switched on (see before()). In a database without a key installed the
+    // tenant is still an ordinary setting and this would fail; see REVIEW-stage2.md status table.
     async () => {
       const rows = await withTenant(app, tenantA, async (c) => {
         await c.query("select set_config('app.tenant_id', $1, true)", [tenantB]);
@@ -274,15 +285,15 @@ describe("SECURITY DEFINER functions", () => {
 describe("identity and state", () => {
   test(
     "[DEFECT SEC-013] one external identity maps to at most one tenant membership (otherwise the API picks an arbitrary tenant)",
-    { todo: "SEC-013: users is unique per (tenant, provider, subject); auth_lookup_user() returns every match and the API takes rows[0]" },
+    // Fixed by migration 020: one active membership per identity (the second insert is refused), deterministic lookup.
     async () => {
       const subject = `user_sec${randomUUID().slice(0, 8).replace(/-/g, "")}`;
       for (const t of [tenantA, tenantB]) {
         await withTenant(app, t, (c) =>
           c.query("insert into users (tenant_id, auth_provider, external_subject, name, role) values ($1, 'clerk', $2, 'Dual', 'STAFF')", [t, subject]),
-        );
+        ).catch((err: { code?: string }) => assert.equal(err.code, "23505", "the second membership must be refused as a unique violation"));
       }
-      const r = await app.query("select tenant_id from auth_lookup_user('clerk', $1)", [subject]);
+      const r = await withTestAuthClient(app, (c) => c.query("select tenant_id from auth_lookup_user('clerk', $1)", [subject]));
       assert.ok((r.rowCount ?? 0) <= 1, `${r.rowCount} memberships returned for one sign-in; apps/api authentication.service.ts uses rows[0] with no ORDER BY`);
     },
   );
@@ -310,7 +321,7 @@ describe("identity and state", () => {
 describe("webhook endpoint URLs", () => {
   test(
     "[DEFECT SEC-012] the database accepts a webhook URL that points at the cloud metadata service or localhost",
-    { todo: "SEC-012: only '^https?://' is checked; SSRF filtering must live in the dispatcher (not built yet) and ideally also in the engine" },
+    // Fixed in the database by migration 019 (the dispatcher must still resolve and re-check at delivery time).
     async () => {
       let accepted = 0;
       for (const url of ["http://169.254.169.254/latest/meta-data/", "http://localhost:5432/", "http://10.0.0.5/admin"]) {

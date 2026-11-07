@@ -68,7 +68,7 @@ describe("hold sweep vs allocation insert: no lock-order deadlock", () => {
   // part-way through its booking locks while the insert trigger takes the allocation locks. Releasing the pin
   // lets both continue. With opposite lock orders (before migration 016) one of them is aborted with 40P01.
   for (const [label, sweep] of [
-    ["cross-tenant sweep", (t: string) => { void t; return db.app.query("select expire_booking_holds()"); }],
+    ["cross-tenant sweep", (t: string) => { void t; return db.platform.query("select expire_booking_holds()"); }],
     ["tenant sweep", (t: string) => withTenant(db.app, t, (c) => c.query("select expire_booking_holds_for_current_tenant()"))],
   ] as const) {
     it(`forced interleaving: ${label} vs new hold over the same expired holds`, async () => {
@@ -113,9 +113,9 @@ describe("hold sweep vs allocation insert: no lock-order deadlock", () => {
       await seedExpiredHolds(t, f, resource, HOLDS, SLOT);
       const results = await Promise.allSettled([
         createWideHold(t, f, resource, HOLDS * SLOT),
-        db.app.query("select expire_booking_holds()"),
+        db.platform.query("select expire_booking_holds()"),
         withTenant(db.app, t, (c) => c.query("select expire_booking_holds_for_current_tenant()")),
-        db.app.query("select expire_booking_holds()"),
+        db.platform.query("select expire_booking_holds()"),
       ]);
       if (results[0]?.status === "fulfilled") created++;
       for (const [i, r] of results.entries()) {
@@ -158,7 +158,7 @@ describe("hold sweep vs allocation insert: no lock-order deadlock", () => {
           }
         });
       const results = await Promise.allSettled([
-        twoResourceHold(), twoResourceHold(), db.app.query("select expire_booking_holds()"),
+        twoResourceHold(), twoResourceHold(), db.platform.query("select expire_booking_holds()"),
         withTenant(db.app, t, (c) => c.query("select expire_booking_holds_for_current_tenant()")),
       ]);
       for (const [i, r] of results.entries()) {
@@ -201,7 +201,7 @@ describe("hold sweep vs allocation insert: no lock-order deadlock", () => {
     assert.equal(liveRow?.status, "HOLD");
     assert.equal(liveRow?.active, true);
     // cross-tenant sweep is a no-op now for this tenant
-    await db.app.query("select expire_booking_holds()");
+    await db.platform.query("select expire_booking_holds()");
     const again = await withTenant(db.app, t, async (c) => (await c.query<{ n: number }>("select count(*)::int as n from bookings where status = 'EXPIRED'")).rows[0]?.n);
     assert.equal(again, 3);
   });
