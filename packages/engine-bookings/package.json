@@ -7,12 +7,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "check": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@qenbel/config-packs": "*",
     "@qenbel/db": "*",
     "@qenbel/shared": "*",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
   }
 }
