@@ -111,8 +111,7 @@ with no pack, or `orderMode: "none"` (salon, clinic), cannot write orders.
 - Cancelling or rejecting a paid order records a full refund ledger entry (method `refundMethod`, default `other`), so the
   order ends `CANCELLED`/`REJECTED` with `payment_status` `refunded`.
 - `REFUNDED` is reachable only from FULFILLED, and only when the ledger is fully refunded.
-- `onBehalfOfCustomerId` on `placeOrder` and `cancelOrder` is for customer-facing channels: the API sets it from the
-  verified contact; an order of another customer then looks absent (`NOT_FOUND`) and the customer cannot be swapped.
+- Ownership on customer channels comes only from `ctx.subject` (see below); there is no ownership field in any input.
 
 ## Payments ledger
 
@@ -145,16 +144,44 @@ and paise only; no names, phones or notes.
 
 Payloads carry `kind` (`payment` or `refund`) on the two payment events, and `status` / `previousStatus` on order events. PROCESSING, READY and REFUNDED send no order event. Every mutation also writes an `audit_log` row (`order.*`).
 
+## Customer channels: ownership and limits
+
+`web_chat`, `whatsapp` and `voice` are customer channels (`src/scope.ts`, same split as engine-bookings). The caller is an
+end customer known only through `ctx.subject.customerId`, which the channel layer sets from the verified contact; tool
+arguments never do. `dashboard` (staff) and `api` (a trusted server integration with its own credential, acting for the
+tenant) are not restricted by this; a subject on them is ignored.
+
+- **Ownership (SEC-007).** `placeOrder`, `cancelOrder`, `getOrder` and `getOrderStatusForChannel` act only on an order whose
+  `customer_id` is the subject. No subject, someone else's order, an order with no customer and an id that does not exist
+  all give the same `NOT_FOUND` body. Ownership is checked on an unlocked read before the row lock. `getOrderStatusForChannel`
+  requires a subject on every channel. `listOrders` returns only the subject's orders (empty without a subject).
+- **Customer cannot be changed.** On a customer channel `placeOrder` refuses an inline `customer` or another `customerId`
+  (`CUSTOMER_CHANGE_NOT_ALLOWED`); the pack's required fields are checked on the subject's own record. `cancelOrder` refuses
+  `refundMethod`. `createOrderDraft` needs a subject (`FORBIDDEN`, `CUSTOMER_REQUIRED`), stores it as the customer and
+  `subject.conversationId` as `orders.conversation_id`; another `customerId` or another customer's `bookingId` is `NOT_FOUND`.
+- **Staff only.** `acceptOrder`, `startProcessing`, `markReady`, `fulfil`, `rejectOrder`, `transitionOrder`, `addItem`,
+  `updateItem`, `removeItem`, `updateOrderNotes`, `applyDiscount`, `removeDiscount`, `setFulfilment`, `recordPayment`,
+  `recordRefund`, `listPayments` and `getOrderBoard` are `FORBIDDEN` (`CHANNEL_NOT_ALLOWED`) on customer channels.
+  `capOverride: true` is refused on every channel except `dashboard` (`CAP_OVERRIDE_NOT_ALLOWED`).
+- **Limits (server-side, beyond the schema).** Customer channels: 50 lines, 99 per line, 500 units per order, list pages of
+  at most 25, at most `MAX_DRAFTS_PER_CUSTOMER_PER_DAY` (20) drafts per customer per 24 h (`RATE_LIMITED`, `DRAFT_LIMIT`).
+  Staff and api: 100 lines, 999 per line, 5000 units, list pages of at most 100. Board: at most 50 cards per column; payment
+  lists at most 500 entries.
+- **Idempotency (SEC-010).** The engine route is `engine:orders:<function>:<principal tag>` (hash of actor kind, id,
+  channel, subject customer and conversation), on top of the database's `app.principal` binding (migration 018). Another
+  principal repeating a key is a plain miss: no replay, no `IDEMPOTENCY_CONFLICT`.
+- **Errors (SEC-022, SEC-009).** Mapped Postgres errors carry no constraint names. An inline customer on a staff placement is
+  matched by phone, then e-mail (any case); a racing insert (23505) is re-looked-up, else a neutral `VALIDATION_FAILED`.
+
 ## AI and WhatsApp view
 
-`getOrderStatusForChannel({ customerId, orderId | orderReference })` returns reference, status and its pack label, payment
-status, lines (name, quantity, unit and line paise, line note), total, currency, version and updatedAt. Nothing else. The
-`customerId` comes from the verified contact, not from the model. An order that is someone else's, has no customer, does
-not exist, or only matches a prefix of the reference all give the identical `NOT_FOUND` body.
+`getOrderStatusForChannel({ orderId | orderReference })` returns reference, status and its pack label, payment status,
+lines (name, quantity, unit and line paise, line note), total, currency, version and updatedAt. Nothing else. The customer
+is `ctx.subject.customerId`; a `customerId` in the input is `VALIDATION_FAILED`. A prefix of a reference matches nothing.
 
 ## Limits and notes
 
-- 100 lines per order, 999 per line (identical item/variant/note/price lines merge), order total at most
+- Staff: 100 lines per order, 999 per line, 5000 units (identical item/variant/note/price lines merge; customer limits above), order total at most
   `MAX_ORDER_TOTAL_PAISE`, ledger entry at most `MAX_ENTRY_PAISE`.
 - One currency per order (taken from the first item).
 - The dine-in table is `orders.resource_id` (composite FK to `resources`, so another tenant's table is refused by the engine as

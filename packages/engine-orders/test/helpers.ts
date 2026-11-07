@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
   createPool,
+  createTestTenant,
   resolveDatabaseUrls,
   runMigrations,
   withTenant,
@@ -65,26 +66,7 @@ export function tx<T>(db: TestDb, tenantId: string, fn: (c: Client) => Promise<T
 
 export async function createTenant(db: TestDb, pack: string | null, prefix = "ord"): Promise<string> {
   const slug = `${prefix}-${randomUUID().slice(0, 8)}`;
-  // Since migration 017 the runtime role cannot call platform_create_tenant. The owner role steps into qenbel_platform
-  // for this one statement (works with and without 017).
-  const client = await db.owner.connect();
-  try {
-    await client.query("begin");
-    await client.query("set local role qenbel_platform");
-    const res = await client.query<{ id: string }>("select platform_create_tenant($1, $2, 'central', $3, $4) as id", [
-      slug,
-      `Test ${slug}`,
-      pack,
-      pack === null ? null : "1.0.0",
-    ]);
-    await client.query("commit");
-    return (res.rows[0] as { id: string }).id;
-  } catch (err) {
-    await client.query("rollback").catch(() => undefined);
-    throw err;
-  } finally {
-    client.release();
-  }
+  return createTestTenant(db.owner, { slug, name: `Test ${slug}`, packId: pack });
 }
 
 export async function insert(c: Client, table: string, row: Record<string, unknown>): Promise<string> {

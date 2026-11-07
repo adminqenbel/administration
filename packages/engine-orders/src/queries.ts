@@ -3,7 +3,7 @@ import { toPaise } from "@qenbel/db";
 import { ErrorCode, OrderStatus, type Channel, type EngineContext, type Paise, type PaymentStatus, type SqlClient } from "@qenbel/shared";
 import { assertTenantSession, notFound, orderError, parseInput } from "./common.ts";
 import { loadPackContext } from "./pack.ts";
-import { actsForCustomer, assertOwnsOrder, limitsFor, requireStaff, requireSubject, subjectCustomerId } from "./scope.ts";
+import { actsForCustomer, assertOwnsOrder, limitsFor, requireStaff, subjectCustomerId } from "./scope.ts";
 import {
   getOrderInputSchema,
   listOrdersInputSchema,
@@ -176,8 +176,9 @@ export async function listOrders(sql: SqlClient, ctx: EngineContext, rawInput: L
   // A customer sees only their own orders, in small pages; staff see the tenant's, in pages of at most 100.
   const input = { ...parsed, limit: Math.min(parsed.limit, limitsFor(ctx).maxListLimit) };
   if (actsForCustomer(ctx)) {
-    const subject = requireSubject(ctx);
-    if (input.customerId !== undefined && input.customerId !== subject) throw notFound("ORDER_NOT_FOUND");
+    // Only the subject's own orders; no subject, or a filter on someone else, is simply an empty page.
+    const subject = subjectCustomerId(ctx);
+    if (subject === undefined || (input.customerId !== undefined && input.customerId !== subject)) return { items: [], nextCursor: null };
     input.customerId = subject;
   }
   const packCtx = await loadPackContext(sql, ctx, false);

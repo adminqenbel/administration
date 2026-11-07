@@ -32,7 +32,7 @@ import {
   type StepOrderInput,
   type TransitionOrderInput,
 } from "./schemas.ts";
-import { buildOrderView, loadItemRows, loadLedgerSums, type OrderRow, type OrderView } from "./view.ts";
+import { buildOrderView, loadItemRows, loadLedgerSums, loadOrderRow, type OrderRow, type OrderView } from "./view.ts";
 import { lockOrder } from "./write.ts";
 
 interface TransitionOptions {
@@ -239,7 +239,9 @@ async function run(
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, true);
   try {
-    // Lock first so concurrent callers queue; ownership is checked before the version so a foreign order looks absent.
+    // Ownership first, on an unlocked read, so a guessed id can neither make anyone wait nor tell anything apart.
+    if (actsForCustomer(ctx)) assertOwnsOrder(ctx, await loadOrderRow(sql, ctx, orderId, false));
+    // Then lock so concurrent callers queue, and re-check on the locked row before the version.
     const order = await lockOrder(sql, ctx, orderId, undefined);
     assertOwnsOrder(ctx, order);
     if (expectedVersion !== undefined && order.version !== expectedVersion) {
@@ -269,6 +271,7 @@ export async function placeOrder(sql: SqlClient, ctx: EngineContext, rawInput: P
   await assertTenantSession(sql, ctx);
   const packCtx = await loadPackContext(sql, ctx, true);
   try {
+    if (actsForCustomer(ctx)) assertOwnsOrder(ctx, await loadOrderRow(sql, ctx, input.orderId, false));
     const order = await lockOrder(sql, ctx, input.orderId, undefined);
     assertOwnsOrder(ctx, order);
     if (input.expectedVersion !== undefined && order.version !== input.expectedVersion) {

@@ -1,15 +1,14 @@
 // Who is calling, and for whom. The channel layer sets `ctx.actor.channel` and, for a verified end customer,
 // `ctx.subject.customerId` (from the verified contact, never from tool arguments).
 //
-// Policy (fail closed):
+// Policy (fail closed), the same as engine-bookings (src/access.ts):
 //  * web_chat, whatsapp, voice are CUSTOMER channels. They may only draft, view, place and cancel THEIR OWN orders, and
 //    every such call needs `ctx.subject.customerId`. Missing subject, an order of someone else, an order with no customer
 //    and a non-existent order all give the same NOT_FOUND body. Staff operations (accept/prepare/fulfil/reject, edits,
-//    discounts, payments, refunds, lists, board) are FORBIDDEN on these channels.
-//  * dashboard is trusted staff: no subject needed.
-//  * api is an integration credential acting for the tenant (for example a shop backend). Without a subject it behaves
-//    like staff (the credential's tool and permission scope is enforced by the API). If the integration sets a subject,
-//    it is treated exactly like a customer channel for that call. Nothing here grants capOverride to `api`.
+//    discounts, payments, refunds, payment lists, board) are FORBIDDEN on these channels.
+//  * dashboard (staff) and api (a trusted server integration with its own credential, acting for the tenant) are not
+//    restricted by any of this; the API enforces their permissions and tool scopes. A subject on those channels is ignored.
+//    capOverride is still accepted only from the dashboard.
 import { AppError, Channel, ErrorCode, type EngineContext } from "@qenbel/shared";
 import { notFound, orderError } from "./common.ts";
 
@@ -24,9 +23,9 @@ export function subjectCustomerId(ctx: EngineContext): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-/** True when this call runs on behalf of an end customer: a customer channel, or any call that carries a subject. */
+/** True when this call runs on behalf of an end customer (a customer channel). */
 export function actsForCustomer(ctx: EngineContext): boolean {
-  return isCustomerChannel(ctx) || subjectCustomerId(ctx) !== undefined;
+  return isCustomerChannel(ctx);
 }
 
 /** Operations only trusted staff or an unscoped integration may call. */
@@ -63,6 +62,6 @@ export interface Limits {
 
 export function limitsFor(ctx: EngineContext): Limits {
   return actsForCustomer(ctx)
-    ? { maxLines: 50, maxQuantityPerLine: 99, maxUnits: 500, maxListLimit: 10 }
+    ? { maxLines: 50, maxQuantityPerLine: 99, maxUnits: 500, maxListLimit: 25 }
     : { maxLines: 100, maxQuantityPerLine: 999, maxUnits: 5000, maxListLimit: 100 };
 }

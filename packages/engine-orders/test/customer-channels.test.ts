@@ -203,17 +203,15 @@ describe("customer channels cannot reach staff operations", () => {
     assert.equal(d2.items.length, 1);
   });
 
-  it("the api channel is an unscoped integration: it works as staff without a subject, and as a customer with one", async () => {
+  it("the api channel is a trusted integration (like engine-bookings): staff operations work, a subject is ignored", async () => {
     const o = await placedOrderOf(fx.customerId);
     const api = ctxFor(fx.tenantId, { channel: "api", actor: { kind: "api_credential", id: "cred-shop", channel: "api" } });
     const accepted = await call((s) => acceptOrder(s, api, { orderId: o.id, expectedVersion: o.version }));
     assert.equal(accepted.status, "ACCEPTED");
-    const scoped = { ...api, subject: { customerId: fx.otherCustomerId } };
-    await rejectsWith(() => call((s) => getOrder(s, scoped, { orderId: o.id })), "NOT_FOUND", "ORDER_NOT_FOUND");
-    await rejectsWith(() => call((s) => cancelOrder(s, scoped, { orderId: o.id })), "NOT_FOUND", "ORDER_NOT_FOUND");
-    await rejectsWith(() => call((s) => startProcessing(s, scoped, { orderId: o.id, expectedVersion: accepted.version })), "FORBIDDEN", "CHANNEL_NOT_ALLOWED");
-    const own = { ...api, subject: { customerId: fx.customerId } };
-    assert.equal((await call((s) => getOrder(s, own, { orderId: o.id }))).id, o.id);
+    const withSubject = { ...api, subject: { customerId: fx.otherCustomerId } };
+    assert.equal((await call((s) => getOrder(s, withSubject, { orderId: o.id }))).id, o.id);
+    const p = await call((s) => startProcessing(s, withSubject, { orderId: o.id, expectedVersion: accepted.version }));
+    assert.equal(p.status, "PROCESSING");
   });
 
   it("discount and cap override: never from a customer channel; the override only from the dashboard", async () => {
@@ -280,18 +278,18 @@ describe("customer-channel drafts and lists are bounded and scoped", () => {
     await call((s) => createOrderDraft(s, staff(), { items: [{ catalogueItemId: fx.papad, quantity: 1 }], customerId: lone }));
   });
 
-  it("listOrders: a customer sees only their own, in pages of at most 10; staff pages stop at 100", async () => {
+  it("listOrders: a customer sees only their own, in pages of at most 25; no subject is an empty page; staff pages stop at 100", async () => {
     const lister = await call((s) => insert(s, "customers", { tenant_id: fx.tenantId, name: "Lister", phone: "+919833300002" }));
-    for (let i = 0; i < 12; i++) await call((s) => createOrderDraft(s, staff(), { items: [{ catalogueItemId: fx.papad, quantity: 1 }], customerId: lister }));
+    for (let i = 0; i < 27; i++) await call((s) => createOrderDraft(s, staff(), { items: [{ catalogueItemId: fx.papad, quantity: 1 }], customerId: lister }));
     const c = asCustomer("whatsapp", lister);
     const page = await call((s) => listOrders(s, c, { limit: 100 }));
-    assert.equal(page.items.length, 10);
+    assert.equal(page.items.length, 25);
     assert.ok(page.nextCursor);
     assert.ok(page.items.every((i) => i.customerId === lister));
     const page2 = await call((s) => listOrders(s, c, { limit: 100, cursor: page.nextCursor! }));
     assert.equal(page2.items.length, 2);
-    await rejectsWith(() => call((s) => listOrders(s, c, { customerId: fx.customerId })), "NOT_FOUND", "ORDER_NOT_FOUND");
-    await rejectsWith(() => call((s) => listOrders(s, asCustomer("whatsapp", undefined), {})), "FORBIDDEN", "CUSTOMER_REQUIRED");
+    assert.deepEqual(await call((s) => listOrders(s, c, { customerId: fx.customerId })), { items: [], nextCursor: null });
+    assert.deepEqual(await call((s) => listOrders(s, asCustomer("whatsapp", undefined), {})), { items: [], nextCursor: null });
     await rejectsWith(() => call((s) => listOrders(s, staff(), { limit: 101 })), "VALIDATION_FAILED");
     assert.ok((await call((s) => listOrders(s, staff(), { limit: 100 }))).items.length <= 100);
     await rejectsWith(() => call((s) => getOrderBoard(s, staff(), { limitPerStatus: 51 })), "VALIDATION_FAILED");
