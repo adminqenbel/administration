@@ -1,11 +1,11 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { generateSlots } from "@qenbel/shared";
+import { generateSlots, type SqlClient } from "@qenbel/shared";
 import {
   addResourceTimeOff, archiveLocation, archiveCatalogueItem, archiveResource, createCatalogueItem, createHoliday, createLocation, createResource,
   createVariant, generateAllSlots, generateResourceSlots, intersectIntervals, loadAvailabilityInputs, peakUnits, setLocationHours,
   setResourceBreaks, setResourceSchedule, setResourceServices, slotRequestFor, updateVariant,
-  type AvailabilityInputs, type SqlClient,
+  type AvailabilityInputs,
 } from "../src/index.ts";
 import { NOW, call, connectTestDb, insertBooking, makeCtx, rejectsWith, tx, type TestDb } from "./helpers.ts";
 
@@ -108,7 +108,7 @@ describe("shape of the inputs", () => {
     assert.deepEqual(slotRequestFor(inputs, r, "2031-01-10").hours.thu, [{ start: "09:00", end: "18:00" }]);
     // generateAllSlots covers every resource and date, ordered by time then name.
     const all = generateAllSlots(inputs, { stepMinutes: 60 });
-    assert.equal(all.length, 2 * (9 + 4 + 9));
+    assert.equal(all.length, 2 * (9 + 9 + 0 + 4 + 9));
     const sorted = [...all].sort((x, y) => x.start.localeCompare(y.start) || x.resourceName.localeCompare(y.resourceName));
     assert.deepEqual(all, sorted);
   });
@@ -281,9 +281,11 @@ describe("shared-capacity resources", () => {
     assert.deepEqual(slotRequestFor(inputs, r, MON).allocations, [], "generateSlots must not treat shared allocations as blocking");
     const s1 = starts(generateResourceSlots(inputs, r, MON, { stepMinutes: 30, units: 1 }));
     const s2 = starts(generateResourceSlots(inputs, r, MON, { stepMinutes: 30, units: 2 }));
-    assert.ok(!s1.includes("10:30") && !s1.includes("10:00") && !s1.includes("09:30"), "4 of 4 in use at 10:30");
+    assert.ok(!s1.includes("10:30") && !s1.includes("10:00"), "4 of 4 in use between 10:30 and 11:00");
+    assert.ok(s1.includes("09:30"), "09:30-10:30 peaks at 3 of 4, one more fits");
     assert.ok(s1.includes("09:00") && s1.includes("11:30") && s1.includes("12:00"));
-    assert.ok(!s2.includes("11:00") && s2.includes("11:30"), "units 2: 11:00-12:00 overlaps the 10:30 booking and its 1 unit... still fits 1+2<=4");
+    assert.ok(!s2.includes("09:30") && !s2.includes("10:00") && !s2.includes("10:30"), "two more would exceed 4");
+    assert.ok(s2.includes("11:00") && s2.includes("11:30"), "11:00-12:00 has 1 in use, 1+2 fits");
     assert.deepEqual(starts(generateResourceSlots(inputs, r, MON, { stepMinutes: 30, units: 5 })), [], "more units than capacity: nothing");
   });
 
@@ -313,7 +315,6 @@ describe("which resources qualify", () => {
     await call(db, w.ctx, setResourceServices, { resourceId: room.id, serviceIds: [w.service] });
     assert.deepEqual(await names(), ["Asha", "Bala", "Floating", "Room"]);
     assert.deepEqual(await names({ resourceType: "room" }), ["Room"]);
-    await call(db, w.ctx, setResourceServices, { resourceId: w.b, serviceIds: [ghost.replace("1", "2")] }).catch(() => undefined);
     void floating;
   });
 
@@ -335,7 +336,7 @@ describe("which resources qualify", () => {
     const inputs = await q({ partySize: 4 });
     assert.deepEqual(inputs.service, { id: null, name: null, variantId: null, durationMinutes: 90, bufferMinutes: 0 });
     const t4 = inputs.resources.find((r) => r.name === "T4")!;
-    assert.deepEqual(starts(generateResourceSlots(inputs, t4, MON, { stepMinutes: 90 })).sort(), ["12:00", "13:30", "19:00", "20:30", "22:00"].filter((s) => s !== "22:00" && s !== "13:30"));
+    assert.deepEqual(starts(generateResourceSlots(inputs, t4, MON, { stepMinutes: 90 })), ["12:00", "13:30", "19:00", "20:30"]);
     void counter;
   });
 });

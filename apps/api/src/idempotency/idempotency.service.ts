@@ -87,8 +87,8 @@ export class IdempotencyService {
         if (row.stale) {
           // The first attempt died without finishing. Take it over, but only one taker wins.
           const taken = await client.query(
-            "update idempotency_keys set locked_at = now() where id = $1 and status = 'in_progress' and locked_at = $2 returning id",
-            [row.id, row.locked_at],
+            "update idempotency_keys set locked_at = now() where id = $1 and status = 'in_progress' and locked_at < now() - make_interval(secs => $2::double precision) returning id",
+            [row.id, this.config.idempotency.lockTimeoutMs / 1000],
           );
           if (taken.rowCount === 1) return { outcome: "owner", id: row.id };
         }

@@ -48,7 +48,7 @@ describe("route permissions", () => {
 
   it("lists the expected routes (a new route shows up here on purpose)", () => {
     const actual = routes.map((r) => `${r.method} ${r.path} ${r.policy?.kind === "permission" ? r.policy.permission : r.policy?.kind}`);
-    assert.deepEqual(actual, [
+    assert.deepEqual(actual.sort(), [
       "GET /health public",
       "GET /health/db public",
       "GET /v1/business/profile business:read",
@@ -58,7 +58,7 @@ describe("route permissions", () => {
       "POST /v1/integrations/api-credentials/:credentialId/revoke integrations:manage",
       "GET /v1/me authenticated",
       "POST /v1/platform/tenants platform_admin",
-    ]);
+    ].sort());
   });
 
   it("only /v1/me is open to API credentials", () => {

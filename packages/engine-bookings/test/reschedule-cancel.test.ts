@@ -247,7 +247,7 @@ describe("cancelBooking", () => {
   });
 
   test("inside the window under `allow` (clinic pack): accepted, no fee", async () => {
-    const s = await seedSalon(env, { pack: "clinic", resources: 1 });
+    const s = await seedSalon(env, { pack: "clinic", resources: 1, resourceType: "doctor" });
     await setSettings(s, { deposit: { fixedPaise: 10_000 } });
     const b = await book(env, s);
     assert.equal(b.policy.lateCancellation, "allow");
