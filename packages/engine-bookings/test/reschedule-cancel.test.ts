@@ -161,14 +161,14 @@ describe("rescheduleBooking", () => {
     const s = await seedSalon(env, { resources: 1 });
     const b = await book(env, s);
     const twoHoursBefore = atDate(-120);
-    const customer = customerCtx(s.tenantId, { now: twoHoursBefore });
+    const customer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: twoHoursBefore });
     const moved = await tx(env, customer, (c) => rescheduleBooking(c, customer, { bookingId: b.id, startsAt: at(180), expectedVersion: b.version }));
     assert.equal(moved.booking.policy.lastRescheduleLate, true, "salon policy is flag: allowed, recorded");
 
     const s2 = await seedSalon(env, { resources: 1 });
     await setSettings(s2, { cancellationPolicy: { lateCancellation: "block", cancelUntilHoursBefore: 24 } });
     const b2 = await book(env, s2);
-    const c2 = customerCtx(s2.tenantId, { now: atDate(-120) });
+    const c2 = customerCtx(s2.tenantId, { subject: { customerId: s2.customerId }, now: atDate(-120) });
     await expectAppError(
       tx(env, c2, (c) => rescheduleBooking(c, c2, { bookingId: b2.id, startsAt: at(180), expectedVersion: b2.version })),
       ErrorCode.FORBIDDEN,
@@ -178,7 +178,7 @@ describe("rescheduleBooking", () => {
     const ok = await tx(env, staff, (c) => rescheduleBooking(c, staff, { bookingId: b2.id, startsAt: at(180), expectedVersion: b2.version }));
     assert.equal(ok.booking.startsAt, at(180));
     // Outside the window a customer may move it.
-    const early = customerCtx(s2.tenantId, { now: atDate(-60 * 24 * 5) });
+    const early = customerCtx(s2.tenantId, { subject: { customerId: s2.customerId }, now: atDate(-60 * 24 * 5) });
     const again = await tx(env, early, (c) => rescheduleBooking(c, early, { bookingId: b2.id, startsAt: at(240), expectedVersion: ok.booking.version }));
     assert.equal(again.booking.policy.lastRescheduleLate, false);
   });
@@ -262,7 +262,7 @@ describe("cancelBooking", () => {
     const s = await seedSalon(env, { resources: 1 });
     await setSettings(s, { cancellationPolicy: { lateCancellation: "block", cancelUntilHoursBefore: 24, lateFeePaise: 2_500 } });
     const b = await book(env, s);
-    const customer = customerCtx(s.tenantId, { now: atDate(-120) });
+    const customer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: atDate(-120) });
     const err = await expectAppError(tx(env, customer, (c) => cancelBooking(c, customer, { bookingId: b.id })), ErrorCode.FORBIDDEN);
     assert.equal(err.details.reason, "late_cancellation_blocked");
     const ctx = ctxFor(s.tenantId);
@@ -273,7 +273,7 @@ describe("cancelBooking", () => {
     assert.equal(res.cancellation.feePaise, 2_500);
     // A customer outside the window may cancel.
     const b2 = await book(env, s, { minutes: 120 });
-    const early = customerCtx(s.tenantId, { now: atDate(-60 * 72) });
+    const early = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: atDate(-60 * 72) });
     assert.equal((await tx(env, early, (c) => cancelBooking(c, early, { bookingId: b2.id }))).cancellation.outcome, "free");
   });
 
@@ -281,7 +281,7 @@ describe("cancelBooking", () => {
     const s = await seedSalon(env, { resources: 1 });
     const b = await book(env, s); // snapshot: 4 hours, flag
     await setSettings(s, { cancellationPolicy: { cancelUntilHoursBefore: 100, lateCancellation: "block" } });
-    const customer = customerCtx(s.tenantId, { now: atDate(-60 * 10) }); // 10 hours before: free under the snapshot
+    const customer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: atDate(-60 * 10) }); // 10 hours before: free under the snapshot
     const res = await tx(env, customer, (c) => cancelBooking(c, customer, { bookingId: b.id }));
     assert.equal(res.cancellation.outcome, "free");
     assert.equal(res.cancellation.cancelUntilHoursBefore, 4);
@@ -332,8 +332,8 @@ describe("cancelBooking", () => {
     const s = await seedSalon(env, { resources: 1 });
     await setSettings(s, { cancellationPolicy: { lateCancellation: "block", cancelUntilHoursBefore: 720 } });
     const ctx0 = ctxFor(s.tenantId);
-    const h = await tx(env, ctx0, (c) => createHold(c, ctx0, { startsAt: at(0), catalogueItemId: s.serviceId }));
-    const customer = customerCtx(s.tenantId, { now: atDate(-30) });
+    const h = await tx(env, ctx0, (c) => createHold(c, ctx0, { startsAt: at(0), catalogueItemId: s.serviceId, customerId: s.customerId }));
+    const customer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: atDate(-30) });
     const res = await tx(env, customer, (c) => cancelBooking(c, customer, { bookingId: h.booking.id }));
     assert.equal(res.cancellation.outcome, "free");
     void getPack;

@@ -97,7 +97,7 @@ describe("outbox events and audit", () => {
 
   test("the timeline records who did what from which channel; check-in is audited but has no webhook event", async () => {
     const s = await seedSalon(env, { resources: 1 });
-    const agent = ctxFor(s.tenantId, { channel: "whatsapp", kind: "api_credential", actorId: "cred-9" });
+    const agent = ctxFor(s.tenantId, { channel: "whatsapp", kind: "api_credential", actorId: "cred-9", subject: { customerId: s.customerId } });
     const b = await book(env, s, { ctx: agent });
     const staff = ctxFor(s.tenantId, { actorId: "user-1" });
     await tx(env, staff, (c) => checkIn(c, staff, { bookingId: b.id, expectedVersion: b.version }));
@@ -291,7 +291,7 @@ describe("listBookings", () => {
 
   test("filters: status, resource, customer, channel, from/to, local date", async () => {
     const s = await seedSalon(env, { resources: 2 });
-    const web = ctxFor(s.tenantId, { channel: "web_chat", kind: "api_credential", actorId: "w" });
+    const web = ctxFor(s.tenantId, { channel: "web_chat", kind: "api_credential", actorId: "w", subject: { customerId: s.customerId } });
     const a = await book(env, s, { minutes: 0, resourceId: s.resourceIds[0] as string });
     const b = await book(env, s, { minutes: 120, resourceId: s.resourceIds[1] as string, ctx: web });
     const c3 = await book(env, s, { minutes: 24 * 60, resourceId: s.resourceIds[0] as string, confirm: false });

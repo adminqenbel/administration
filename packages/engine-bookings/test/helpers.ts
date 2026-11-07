@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
   createPool,
+  createTestTenant,
   resolveDatabaseUrls,
   runMigrations,
   TEST_DATABASE,
@@ -54,6 +55,8 @@ export interface CtxOptions {
   actorId?: string;
   key?: string;
   now?: Date;
+  /** ctx.subject, as the channel layer would set it from the verified contact. */
+  subject?: { customerId?: string; conversationId?: string };
 }
 
 export function ctxFor(tenantId: string, o: CtxOptions = {}): EngineContext {
@@ -64,6 +67,7 @@ export function ctxFor(tenantId: string, o: CtxOptions = {}): EngineContext {
     now: () => new Date(now.getTime()),
     newId: () => randomUUID(),
     ...(o.key !== undefined ? { idempotencyKey: o.key } : {}),
+    ...(o.subject !== undefined ? { subject: o.subject } : {}),
   };
 }
 
@@ -79,24 +83,7 @@ export function tx<T>(env: Env, ctx: EngineContext, fn: (c: PoolClient) => Promi
 
 export async function createTenant(env: Env, o: { pack?: string; timezone?: string; label?: string } = {}): Promise<string> {
   const slug = `${o.label ?? "eb"}-${randomUUID().slice(0, 8)}`;
-  // Since migration 017 the runtime role cannot call platform_create_tenant (only qenbel_platform_ops can). The suite has
-  // no ops login, so the owner role steps into qenbel_platform for the one statement, as the migrations themselves do.
-  const client = await env.owner.connect();
-  try {
-    await client.query("begin");
-    await client.query("set local role qenbel_platform");
-    const res = await client.query<{ id: string }>(
-      "select platform_create_tenant($1, $2, 'central', $3, '1.0.0', $4) as id",
-      [slug, `Test ${slug}`, o.pack ?? "salon", o.timezone ?? "Asia/Kolkata"],
-    );
-    await client.query("commit");
-    return (res.rows[0] as { id: string }).id;
-  } catch (err) {
-    await client.query("rollback").catch(() => undefined);
-    throw err;
-  } finally {
-    client.release();
-  }
+  return createTestTenant(env.owner, { slug, name: `Test ${slug}`, packId: o.pack ?? "salon", timezone: o.timezone ?? "Asia/Kolkata" });
 }
 
 export async function insert(c: PoolClient, table: string, row: Record<string, unknown>): Promise<string> {

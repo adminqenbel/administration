@@ -10,6 +10,7 @@ import {
   type EngineContext,
   type SqlClient,
 } from "@qenbel/shared";
+import { assertOwnsBooking, isCustomerChannel, loadBookingFor } from "./access.ts";
 import type { ResourceCandidate } from "./availability-source.ts";
 import { loadConfig, type EngineOptions } from "./config.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
@@ -48,11 +49,16 @@ export async function rescheduleBooking(
     return withIdempotency(sql, ctx, "reschedule_booking", { bookingId, ...body }, async () => {
       // Lock order: resources (ascending id) -> booking -> allocations. The resources are only known from the booking's
       // allocations, so read them without a lock, lock the resources, then lock the booking and check nothing moved.
+      // Customer channels: ownership is checked before any lock is taken (SEC-008), and the length cannot change (SEC-005).
+      await assertOwnsBooking(sql, ctx, bookingId);
+      if (isCustomerChannel(ctx) && (body.endsAt !== undefined || body.durationMinutes !== undefined)) {
+        throw new AppError(ErrorCode.VALIDATION_FAILED, "The length of a booking comes from the service.", { reason: "duration_not_allowed" });
+      }
       const peek = await loadActiveAllocations(sql, ctx, bookingId);
       const peekIds = peek.map((a) => a.resource_id);
       await lockResources(sql, ctx, body.resourceId !== undefined ? [...peekIds, body.resourceId] : peekIds);
 
-      const row = await loadBooking(sql, ctx, bookingId, { lock: true });
+      const row = await loadBookingFor(sql, ctx, bookingId, { lock: true });
       assertVersion(row, body.expectedVersion);
       if (row.status !== BookingStatus.CONFIRMED) {
         // Only a confirmed booking has the CONFIRMED -> CONFIRMED edge; a HOLD must be confirmed first.

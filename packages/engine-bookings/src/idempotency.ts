@@ -1,7 +1,8 @@
-// Engine-level idempotency on the idempotency_keys table. Route is "engine-bookings:<function>", which keeps these rows
+// Engine-level idempotency on the idempotency_keys table. Route is "engine-bookings:<function>:<principal tag>", which keeps these rows
 // apart from the API's own per-route rows. The row is written in the same transaction as the change, so a key is only
 // visible when its result is committed: there is no half-finished state to wait on, and a rolled-back call can be retried.
 import { AppError, ErrorCode, idempotencyKeySchema, type EngineContext, type SqlClient } from "@qenbel/shared";
+import { principalTag } from "./access.ts";
 import { canonicalJson, sha256Hex, type Json } from "./util.ts";
 
 interface Stored {
@@ -28,7 +29,8 @@ export async function withIdempotency<T extends object>(
   if (!idempotencyKeySchema.safeParse(key).success) {
     throw new AppError(ErrorCode.VALIDATION_FAILED, "The idempotency key is not valid.", { field: "idempotencyKey" });
   }
-  const route = `engine-bookings:${fn}`;
+  // The acting principal is part of the route: another credential or conversation repeating this key is a plain miss.
+  const route = `engine-bookings:${fn}:${principalTag(ctx)}`;
   const hash = sha256Hex(canonicalJson(canonicalInput));
 
   // An expired key (older than 24 h) no longer counts.

@@ -8,6 +8,7 @@ import {
   type EngineContext,
   type SqlClient,
 } from "@qenbel/shared";
+import { assertStaffChannel } from "./access.ts";
 import { loadConfig, type EngineOptions } from "./config.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
 import { withIdempotency } from "./idempotency.ts";
@@ -39,6 +40,7 @@ async function moveTo(
 ): Promise<WriteResult> {
   return guarded(async () => {
     await assertScope(sql, ctx);
+    assertStaffChannel(ctx);
     const { bookingId, body: rawBody } = splitBookingId(rawInput);
     const body = parseOrThrow(lifecycleInputSchema, rawBody);
     const cfg = await loadConfig(sql, ctx, options);

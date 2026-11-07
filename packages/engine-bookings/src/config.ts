@@ -17,6 +17,7 @@ import {
   type SqlClient,
   type TimeInterval,
 } from "@qenbel/shared";
+import { DEFAULT_LIMITS, type BookingLimits } from "./access.ts";
 import type { AvailabilityDataSource } from "./availability-source.ts";
 
 /** Optional injection points. The API passes its cached pack; tests pass narrowed packs. */
@@ -48,6 +49,24 @@ export const bookingSettingsSchema = z
         lateFeePaise: paise,
         /** A late cancellation forfeits the deposit. Default true. */
         forfeitDepositOnLate: z.boolean(),
+      })
+      .partial()
+      .strict(),
+    /**
+     * Limits for customer channels (web_chat, whatsapp, voice). Live holds and active (future confirmed or checked-in, plus
+     * live holds) bookings per conversation, per verified customer, per credential and per tenant; see src/access.ts.
+     */
+    limits: z
+      .object({
+        holdsPerConversation: z.number().int().min(1).max(20),
+        holdsPerCustomer: z.number().int().min(1).max(50),
+        holdsPerCredential: z.number().int().min(1).max(1000),
+        holdsPerTenant: z.number().int().min(1).max(10_000),
+        activeBookingsPerCustomer: z.number().int().min(1).max(200),
+        activeBookingsPerConversation: z.number().int().min(1).max(200),
+        /** Hold length for a customer channel with no verified customer (capped by holdMinutes). */
+        unverifiedHoldMinutes: z.number().int().min(1).max(120),
+        resourcesPerHold: z.number().int().min(1).max(10),
       })
       .partial()
       .strict(),
@@ -86,6 +105,7 @@ export interface BookingConfig {
   policy: CancellationPolicy;
   deposit: { percentBps: number | null; fixedPaise: number | null };
   requiredCustomerFields: readonly CustomerField[];
+  limits: BookingLimits;
 }
 
 /** The pack's booking machine, narrowed as the pack says. Initial state is always HOLD. */
@@ -140,5 +160,6 @@ export async function loadConfig(sql: SqlClient, ctx: EngineContext, options: En
     },
     deposit: { percentBps: s.deposit?.percentBps ?? null, fixedPaise: s.deposit?.fixedPaise ?? null },
     requiredCustomerFields: pack.requiredCustomerFields,
+    limits: { ...DEFAULT_LIMITS, ...s.limits },
   };
 }

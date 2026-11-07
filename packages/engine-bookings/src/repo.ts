@@ -25,6 +25,7 @@ export interface BookingRow {
   currency: string;
   location_id: string | null;
   customer_id: string | null;
+  conversation_id: string | null;
   catalogue_item_id: string | null;
   created_at: Date;
   updated_at: Date;
@@ -34,7 +35,7 @@ export interface BookingRow {
 export const BOOKING_SELECT = `
   b.id, b.reference, b.status, b.version, b.source_channel, b.starts_at, b.ends_at, b.party_size, b.notes,
   b.hold_expires_at, b.confirmed_at, b.cancelled_at, b.cancellation_reason, b.policy_snapshot,
-  b.deposit_paise, b.deposit_status, b.currency, b.location_id, b.customer_id, b.catalogue_item_id,
+  b.deposit_paise, b.deposit_status, b.currency, b.location_id, b.customer_id, b.conversation_id, b.catalogue_item_id,
   b.created_at, b.updated_at,
   coalesce(
     (select array_agg(distinct a.resource_id order by a.resource_id)

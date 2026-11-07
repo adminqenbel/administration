@@ -395,7 +395,7 @@ describe("hold rules", () => {
       c.query(`update tenants set settings = $2::jsonb where id = $1`, [s.tenantId, JSON.stringify({ bookings: { leadTimeMinutes: 120, maxAdvanceDays: 30 } })]),
     );
     const now = atDate(-60); // 09:00 on the day
-    const customer = customerCtx(s.tenantId, { now });
+    const customer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now });
     const staff = ctxFor(s.tenantId, { now });
     const reasonOf = (e: AppError) => e.details.reason;
     await expectAppError(tx(env, customer, (c) => createHold(c, customer, hold(s, { resourceId: r, startsAt: at(0) }))), ErrorCode.BOOKING_SLOT_TAKEN, (e) => assert.equal(reasonOf(e), "lead_time"));
@@ -403,7 +403,7 @@ describe("hold rules", () => {
     await tx(env, staff, (c) => createHold(c, staff, hold(s, { resourceId: r, startsAt: at(120) }))); // staff are not bound by lead time
 
     const farNow = atDate(-60 - 40 * 24 * 60);
-    const farCustomer = customerCtx(s.tenantId, { now: farNow });
+    const farCustomer = customerCtx(s.tenantId, { subject: { customerId: s.customerId }, now: farNow });
     await expectAppError(tx(env, farCustomer, (c) => createHold(c, farCustomer, hold(s, { resourceId: r, startsAt: at(180) }))), ErrorCode.BOOKING_SLOT_TAKEN, (e) => assert.equal(reasonOf(e), "too_far_ahead"));
     const farStaff = ctxFor(s.tenantId, { now: farNow });
     await tx(env, farStaff, (c) => createHold(c, farStaff, hold(s, { resourceId: r, startsAt: at(180) })));

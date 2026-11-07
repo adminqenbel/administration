@@ -9,6 +9,7 @@ import {
   type EngineContext,
   type SqlClient,
 } from "@qenbel/shared";
+import { loadBookingFor } from "./access.ts";
 import { loadConfig, type EngineOptions } from "./config.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
 import { withIdempotency } from "./idempotency.ts";
@@ -50,7 +51,8 @@ export async function cancelBooking(
     const body = parseOrThrow(cancelBookingSchema, rawBody);
     const cfg = await loadConfig(sql, ctx, options);
     return withIdempotency(sql, ctx, "cancel_booking", { bookingId, ...body }, async () => {
-      const row = await loadBooking(sql, ctx, bookingId, { lock: true });
+      // Customer channels: only the subject's own booking; anything else is NOT_FOUND (SEC-008).
+      const row = await loadBookingFor(sql, ctx, bookingId, { lock: true });
       assertVersion(row, body.expectedVersion);
       assertTransition(cfg.machine, row.status, BookingStatus.CANCELLED, "booking");
 

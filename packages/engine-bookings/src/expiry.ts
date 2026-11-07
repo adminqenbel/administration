@@ -6,6 +6,7 @@
 // Everything here follows it, so expireHolds, createHold and the sweeps cannot deadlock with each other.
 import { z } from "zod";
 import { BookingStatus, type EngineContext, type SqlClient } from "@qenbel/shared";
+import { assertStaffChannel } from "./access.ts";
 import { BookingAuditAction, recordChange } from "./events.ts";
 import { loadBooking, toView } from "./repo.ts";
 import { parseOrThrow } from "./schemas.ts";
@@ -102,6 +103,7 @@ export async function expireHolds(
 ): Promise<ExpireHoldsResult> {
   return guarded(async () => {
     await assertScope(sql, ctx);
+    assertStaffChannel(ctx);
     parseOrThrow(expireInputSchema, rawInput);
     const now = ctx.now();
     const bookingIds = await expireDueHolds(sql, ctx, { cutoff: now, reason: "hold_expired" });
