@@ -17,6 +17,9 @@ npm run check -w @qenbel/db                           # typecheck
 
 Scripts are `node scripts/db.ts <migrate|seed [--reset]|check> [--test]`. `--test` targets the test database.
 
+Isolating a run: the tests use whatever `TEST_DATABASE_URL` / `TEST_DATABASE_MIGRATE_URL` point at (database name `qenbel_admin_test` is only the default), so a second agent or a
+migration experiment can use its own scratch database created with the same roles and grants as `infra/postgres/init`, and never touch the shared one.
+
 Connection settings: `DATABASE_URL` and `DATABASE_MIGRATE_URL` (tests: `TEST_DATABASE_URL`,
 `TEST_DATABASE_MIGRATE_URL`). When unset, URLs are built for the docker-compose database from
 `POSTGRES_PASSWORD` in `infra/.env`. Tests fail with instructions if the database is unreachable; they never skip.
@@ -52,6 +55,11 @@ Migrations are in `migrations/NNN_name.sql`, applied in order, immutable once ap
 | 009 | `follow_up_tasks`, `communications`, `notification_templates`, `notifications` |
 | 010 | `idempotency_keys`, `audit_log`, `outbox_events`, `webhook_endpoints`, `webhook_deliveries` |
 | 011 | RLS on every tenant table, grants, `SECURITY DEFINER` functions |
+| 012 | webhook / outbox event CHECKs: 12 -> 15 events (`booking.expired`, `order.rejected`, `payment.refunded`) |
+| 013 | `resource_time_off`, `resource_breaks`, `resource_services`; moves `resources.attributes.{timeOff,breaks,serviceIds}` into them (`app_move_resource_extras()`) |
+| 014 | customers: partial unique indexes on active phone and `lower(email)` per tenant; clears pre-existing duplicates safely |
+| 015 | `orders.discount_type/_value/_reason/_cap_override`, `orders.resource_id`, `order_items.tax_rate_bps`; backfills |
+| 016 | one lock order (resource -> booking -> allocation) for the allocation trigger and both hold sweeps (fixes a 40P01 deadlock) |
 
 Conventions (all tenant tables unless noted):
 
@@ -70,7 +78,15 @@ Conventions (all tenant tables unless noted):
 - `api_credentials` holds API keys (peppered hash only, `pepper_version` for rotation, `tool_scopes` limited to the 13 tool names)
   and public widget keys (`lookup_id` is the key, `allowed_origins`, scoped tools). `lookup_id` is globally unique.
 - `payments` is a ledger: the app role may insert, read, and update only `status` and `provider_reference`. Corrections are new rows.
-- `outbox_events.event_id` is unique and is the `eventId` sent to webhook subscribers. `type` is limited to the 12 webhook events.
+- `outbox_events.event_id` is unique and is the `eventId` sent to webhook subscribers. `type` is limited to the 15 webhook events (`WebhookEvent`).
+- Resource availability: `resource_schedules` (weekly shifts), `resource_breaks` (weekly breaks, `weekday` 0-6, one row per weekday), `resource_time_off`
+  (`starts_at`/`ends_at`, half-open, `reason`, `created_by_user_id`) and `resource_services` (unique `(resource_id, catalogue_item_id)`; no rows = any service of the
+  matching `required_resource_type`). All have composite tenant FKs, RLS, and `DELETE` for the app role (editable lists).
+- Customers: among customers with `archived_at IS NULL`, `(tenant_id, phone)` and `(tenant_id, lower(email))` are unique (`customers_active_phone_unique`,
+  `customers_active_email_unique`, SQLSTATE `23505`). `phone` is already E.164 by CHECK, so there is no second column. Un-archiving a customer whose number was
+  reused fails with `23505`.
+- Orders: `discount_paise` is the amount taken off; `discount_type` (`fixed` | `percent_bps`) + `discount_value` (paise, or basis points up to 10000) record how, both NULL or both set;
+  `discount_cap_override` records an approved discount above the cap. `orders.resource_id` is the dine-in table (composite FK to `resources`). `order_items.tax_rate_bps` (0-10000, default 0) is the rate frozen on the line.
 
 ## RLS model
 
@@ -126,6 +142,20 @@ Seed uses the same path: tenants via `platform_create_tenant`, everything else v
   blocks a slot; (2) `expire_booking_holds_for_current_tenant(now)` (invoker, under RLS) marks holds `EXPIRED`, bumps `version`, frees allocations;
   (3) `expire_booking_holds(now)` does the same for all tenants, for the background job. The job should run at least every minute.
 
+## Hold expiry and lock order
+
+Everything that releases or expires holds takes locks in one order: **resource row (ascending id) -> booking rows (ascending id) -> allocation rows**.
+The allocation insert trigger (resource, then the bookings of expired overlapping holds, then their allocations) and both sweeps
+(`expire_booking_holds`, `expire_booking_holds_for_current_tenant`) follow it; confirm/cancel already did (booking, then the sync trigger updates allocations).
+Before migration 016 the trigger went allocation-first and the sweeps booking-first, which deadlocked (`40P01`) when a sweep raced a new hold over unswept expired holds.
+`test/hold-sweep-locks.test.ts` forces that interleaving and also races sweeps against inserts. The cross-tenant sweep needs `SELECT` and `UPDATE (updated_at)` on `resources` for `qenbel_platform` (migration 016) to take the resource locks.
+
+## Data migrations under FORCE RLS
+
+The owner role is subject to FORCE RLS, so a migration that rewrites tenant rows runs `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` for the tables it touches, does the work, and forces it again in the same
+transaction (013, 014, 015). The runtime role stays filtered throughout. Tests replay these sections inside rolled-back owner transactions.
+`select app_move_resource_extras();` (013, owner only) is re-runnable: use it if an engine still wrote the interim `resources.attributes` keys after the migration.
+
 ## Capacity model
 
 `resources.allocation_mode` is `exclusive` (default) or `shared`; `resources.capacity_units` and `min_units` describe size.
@@ -140,8 +170,8 @@ Seed uses the same path: tenants via `platform_create_tenant`, everything else v
    10:00-12:00 booking of 3 and a 12:00-14:00 booking of 3 leave room for a 11:00-13:00 booking of 1 on capacity 4.
 3. `allocation_mode` cannot change, and `capacity_units` cannot shrink, while the resource has active allocations (trigger, SQLSTATE `55000`).
 
-Not modelled yet (Stage 2 booking engine): slot generation from `resource_schedules`, `business_hours`, `holidays` and service
-`duration_minutes + buffer_minutes`; staff time off; table-combination rules; status-transition validation (the database checks that a status
+Not modelled yet (Stage 2 booking engine): slot generation from `resource_schedules`, `resource_breaks`, `resource_time_off`, `business_hours`, `holidays` and service
+`duration_minutes + buffer_minutes`; table-combination rules; status-transition validation (the database checks that a status
 is one of the allowed values; `@qenbel/shared` owns which transitions are legal).
 
 ## Tests
@@ -153,6 +183,10 @@ is one of the allowed values; `@qenbel/shared` owns which transitions are legal)
 | `rls.test.ts` | Tenant A cannot read, update, delete or insert-for-B on every tenant table (enumerated from the catalog, as the runtime role and as the FORCE-RLS owner); no tenant means zero rows; pool-leak check; composite FKs; the fixture must cover every table |
 | `bookings.test.ts` | 20 concurrent overlapping bookings give one winner; touching periods and different resources both succeed; hold expiry (live, swept, lazy, cross-tenant); shared capacity |
 | `integrity.test.ts` | audit_log append-only; idempotency unique key, race, 24 h expiry and purge; CHECK constraints reject unknown statuses; ledger limits; enum drift against `enums.ts` |
+| `hold-sweep-locks.test.ts` | Sweeps vs the allocation insert trigger: forced lock interleaving (cross-tenant and tenant sweep), randomised races, multi-resource holds, sweep effects |
+| `resource-availability.test.ts` | 013 constraints, tenant FKs, the attributes-to-rows move (both engine formats, malformed entries kept, idempotent, FORCE restored) |
+| `customers-dedupe.test.ts` | 014 unique indexes (case, archived, tenants, restore, race) and the duplicate clean-up replayed on planted data |
+| `orders-discount.test.ts` | 015 discount CHECKs, `resource_id` tenant FK, `tax_rate_bps` bounds, backfill replayed on planted data |
 | `migrate.test.ts` | idempotent runner, ordering, concurrent runners, tamper detection, rollback of a failing file |
 | `money.test.ts` | `toPaise` |
 

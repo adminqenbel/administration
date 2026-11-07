@@ -85,6 +85,10 @@ async function seedSalon(c: PoolClient, t: string): Promise<void> {
   for (const r of [asha, ravi, meena]) {
     for (let d = 1; d <= 6; d++) await insert(c, "resource_schedules", { tenant_id: t, resource_id: r, weekday: d, start_time: "10:00", end_time: "19:00" });
   }
+  for (const r of [asha, ravi, meena]) {
+    for (let d = 1; d <= 6; d++) await insert(c, "resource_breaks", { tenant_id: t, resource_id: r, weekday: d, start_time: "13:30", end_time: "14:15" });
+  }
+  await insert(c, "resource_time_off", { tenant_id: t, resource_id: ravi, starts_at: istAt(5, 0), ends_at: istAt(7, 0), reason: "Leave (demo)" });
   for (let d = 1; d <= 6; d++) await insert(c, "business_hours", { tenant_id: t, location_id: loc, weekday: d, open_time: "10:00", close_time: "20:00" });
   await insert(c, "holidays", { tenant_id: t, location_id: null, holiday_date: istAt(30, 0).toISOString().slice(0, 10), name: "Demo closure day" });
 
@@ -95,6 +99,10 @@ async function seedSalon(c: PoolClient, t: string): Promise<void> {
   const colour = await insert(c, "catalogue_items", { tenant_id: t, category_id: hair, kind: "service", name: "Hair colour", base_price_paise: 200000, duration_minutes: 120, required_resource_type: "staff", tax_rate_bps: 1800 });
   for (const [name, price, order] of [["Short", 200000, 1], ["Medium", 300000, 2], ["Long", 400000, 3]] as const) {
     await insert(c, "catalogue_variants", { tenant_id: t, item_id: colour, name, price_paise: price, sort_order: order });
+  }
+  // Asha does haircuts and colour, Ravi only haircuts; Meena has no rows, so she can do any staff service.
+  for (const [res, item] of [[asha, haircut], [asha, colour], [ravi, haircut]] as const) {
+    await insert(c, "resource_services", { tenant_id: t, resource_id: res, catalogue_item_id: item });
   }
   await insert(c, "catalogue_items", { tenant_id: t, category_id: hair, kind: "service", name: "Head massage", base_price_paise: 30000, duration_minutes: 30, required_resource_type: "staff", tax_rate_bps: 1800 });
   await insert(c, "catalogue_items", { tenant_id: t, category_id: skin, kind: "service", name: "Facial", base_price_paise: 150000, duration_minutes: 60, required_resource_type: "staff", tax_rate_bps: 1800 });
@@ -122,7 +130,7 @@ async function seedSalon(c: PoolClient, t: string): Promise<void> {
   await allocate(c, t, done, meena, istAt(-1, 12), plusMinutes(istAt(-1, 12), 45));
 
   const order = await insert(c, "orders", { tenant_id: t, location_id: loc, customer_id: c3, booking_id: done, status: "FULFILLED", source_channel: "dashboard", payment_status: "paid", subtotal_paise: 45000, tax_paise: 8100, total_paise: 53100, placed_at: istAt(-1, 13), fulfilled_at: istAt(-1, 13) });
-  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: shampoo, name: "Shampoo 250 ml", quantity: 1, unit_price_paise: 45000, tax_paise: 8100, line_total_paise: 45000 });
+  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: shampoo, name: "Shampoo 250 ml", quantity: 1, unit_price_paise: 45000, tax_paise: 8100, tax_rate_bps: 1800, line_total_paise: 45000 });
   await insert(c, "payments", { tenant_id: t, order_id: order, customer_id: c3, kind: "payment", method: "cash", status: "completed", amount_paise: 53100 });
   await insert(c, "fulfilments", { tenant_id: t, order_id: order, type: "on_site", status: "completed", completed_at: istAt(-1, 13) });
 
@@ -187,11 +195,17 @@ async function seedRestaurant(c: PoolClient, t: string): Promise<void> {
   const counterBooking = await insert(c, "bookings", { tenant_id: t, location_id: loc, customer_id: c3, status: "CONFIRMED", source_channel: "voice", starts_at: dinner, ends_at: plusMinutes(dinner, 60), party_size: 3, confirmed_at: new Date() });
   await allocate(c, t, counterBooking, counter, dinner, plusMinutes(dinner, 60), { units: 3 });
 
-  const order = await insert(c, "orders", { tenant_id: t, location_id: loc, customer_id: c1, booking_id: confirmed, status: "PROCESSING", source_channel: "dashboard", payment_status: "unpaid", subtotal_paise: 60000, tax_paise: 3000, total_paise: 63000, placed_at: new Date() });
-  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: biryani, name: "Veg biryani (Full)", quantity: 1, unit_price_paise: 42000, tax_paise: 2100, line_total_paise: 42000 });
-  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: dal, name: "Dal tadka", quantity: 1, unit_price_paise: 18000, tax_paise: 900, line_total_paise: 18000 });
+  const order = await insert(c, "orders", { tenant_id: t, location_id: loc, customer_id: c1, booking_id: confirmed, resource_id: tables[2], status: "PROCESSING", source_channel: "dashboard", payment_status: "unpaid", subtotal_paise: 60000, tax_paise: 3000, total_paise: 63000, placed_at: new Date() });
+  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: biryani, name: "Veg biryani (Full)", quantity: 1, unit_price_paise: 42000, tax_paise: 2100, tax_rate_bps: 500, line_total_paise: 42000 });
+  await insert(c, "order_items", { tenant_id: t, order_id: order, catalogue_item_id: dal, name: "Dal tadka", quantity: 1, unit_price_paise: 18000, tax_paise: 900, tax_rate_bps: 500, line_total_paise: 18000 });
   await insert(c, "fulfilments", { tenant_id: t, order_id: order, type: "dine_in", status: "in_progress" });
-  await insert(c, "orders", { tenant_id: t, location_id: loc, customer_id: c2, status: "DRAFT", source_channel: "whatsapp" });
+  // A draft with a 10% discount: 26000 - 2600 = 23400 taxable, 5% tax = 1170, total 24570.
+  const draft = await insert(c, "orders", {
+    tenant_id: t, location_id: loc, customer_id: c2, status: "DRAFT", source_channel: "whatsapp",
+    subtotal_paise: 26000, discount_paise: 2600, tax_paise: 1170, total_paise: 24570,
+    discount_type: "percent_bps", discount_value: 1000, discount_reason: "Regular guest (demo)",
+  });
+  await insert(c, "order_items", { tenant_id: t, order_id: draft, catalogue_item_id: biryani, name: "Veg biryani (Half)", quantity: 1, unit_price_paise: 26000, tax_paise: 1170, tax_rate_bps: 500, line_total_paise: 26000 });
 
   await insert(c, "notification_templates", { tenant_id: t, key: "booking.confirmed", channel: "whatsapp", body: "Your table booking {{reference}} for {{partySize}} is confirmed." });
   await insert(c, "outbox_events", { tenant_id: t, type: "booking.created", aggregate_type: "booking", aggregate_id: hold, payload: json({ bookingId: hold }) });

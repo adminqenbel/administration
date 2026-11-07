@@ -283,3 +283,9 @@ export const IdempotencyStatus = {
   COMPLETED: "completed",
 } as const;
 export type IdempotencyStatus = (typeof IdempotencyStatus)[keyof typeof IdempotencyStatus];
+
+export const DiscountType = {
+  FIXED: "fixed",
+  PERCENT_BPS: "percent_bps",
+} as const;
+export type DiscountType = (typeof DiscountType)[keyof typeof DiscountType];

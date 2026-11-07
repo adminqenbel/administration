@@ -203,6 +203,36 @@ describe("(f) CHECK constraints reject unknown values", () => {
   });
 });
 
+describe("webhook event vocabulary", () => {
+  // Written out on purpose: adding or removing an event must be a deliberate change in four places
+  // (enums.ts, a migration for outbox_events and webhook_endpoints, this list, the webhook docs).
+  const EVENTS_15 = [
+    "booking.cancelled", "booking.completed", "booking.confirmed", "booking.created", "booking.expired", "booking.no_show",
+    "booking.rescheduled", "customer.created", "order.accepted", "order.cancelled", "order.created", "order.fulfilled",
+    "order.rejected", "payment.completed", "payment.refunded",
+  ];
+
+  it("@qenbel/shared WebhookEvent has exactly the 15 events", () => {
+    assert.deepEqual(values(WebhookEvent), EVENTS_15);
+  });
+
+  it("outbox_events accepts each of the 15 and rejects an unknown one", async () => {
+    for (const type of EVENTS_15) {
+      const r = await attempt(db.app, T, "insert into outbox_events (tenant_id, type, payload) values ($1, $2, '{}'::jsonb)", [T, type]);
+      assert.equal(r.ok, true, `${type}: ${r.ok ? "" : r.message}`);
+    }
+    const bad = await attempt(db.app, T, "insert into outbox_events (tenant_id, type, payload) values ($1, 'booking.deleted', '{}'::jsonb)", [T]);
+    assert.deepEqual(bad.ok ? null : bad.code, "23514");
+  });
+
+  it("webhook_endpoints.events accepts the 15 and rejects an unknown one", async () => {
+    const ok = await attempt(db.app, T, "insert into webhook_endpoints (tenant_id, url, secret_ciphertext, events) values ($1, 'https://hooks.example.com/all', 'c', $2::text[])", [T, EVENTS_15]);
+    assert.equal(ok.ok, true, ok.ok ? "" : ok.message);
+    const bad = await attempt(db.app, T, "insert into webhook_endpoints (tenant_id, url, secret_ciphertext, events) values ($1, 'https://hooks.example.com/bad', 'c', $2::text[])", [T, ["booking.created", "booking.deleted"]]);
+    assert.deepEqual(bad.ok ? null : bad.code, "23514");
+  });
+});
+
 describe("enum drift: CHECK constraints match @qenbel/shared enums.ts exactly", () => {
   const cases: [string, string, string[]][] = [
     ["bookings", "status", values(BookingStatus)],
